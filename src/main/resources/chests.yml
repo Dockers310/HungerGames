@@ -1,0 +1,9 @@
+templates:
+  common:
+    display-name: "Обычный"
+    icon: CHEST
+    min-items: 2
+    max-items: 5
+    item-chance: 0.85
+    items: []
+arena-chests: {}

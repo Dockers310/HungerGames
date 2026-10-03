@@ -1,0 +1,58 @@
+author: Dok_Si
+border-particles:
+  enabled: true
+  step: 2.0
+  size: 0.8
+
+selection-wand:
+  material: IRON_PICKAXE
+  name: "&dКирка границ арены"
+  lore:
+    - "&7ЛКМ по блоку: установить точку 1"
+    - "&7ПКМ по блоку: установить точку 2"
+    - "&eЕсли точка уже есть: нужен второй такой же клик"
+    - "&7Shift+ЛКМ / Shift+ПКМ: удаление тоже подтверждается"
+spawn-wand:
+  material: BLAZE_ROD
+  name: "&eМаркер точки появления"
+  lore:
+    - "&7ЛКМ по блоку: поставить точку"
+    - "&7ПКМ рядом: убрать ближайшую точку"
+container-marker:
+  material: PAPER
+  name: "&6Маркер лута — &f{type}"
+  lore:
+    - "&7Тип лута: &f{type}"
+    - "&aЛКМ по контейнеру — назначить этот шаблон"
+    - "&7ПКМ по контейнеру — открыть его инвентарь"
+    - "&7Поддерживаются сундуки, бочки, раздатчики,"
+    - "&7выбрасыватели, воронки, шалкеры и другие инвентари."
+
+# Старый ключ оставлен для совместимости с прежними конфигами.
+chest-marker:
+  material: PAPER
+  name: "&6Маркер лута — &f{type}"
+  lore:
+    - "&7Тип лута: &f{type}"
+    - "&aЛКМ — назначить шаблон"
+    - "&7ПКМ — открыть контейнер"
+default-arena:
+  min-players: 2
+  max-players: 16
+  protection-seconds: 120
+  chest-refill-seconds: 300
+  shrink-start-delay-seconds: 180
+  shrink-stage-duration-seconds: 60
+  shrink-stages: 3
+  shrink-final-ratio: 0.25
+  border-damage-heart-multiplier: 1.0
+  border-mode: DAMAGE
+  border-changing-start-mode: SOFT_TELEPORT
+  border-changing-target-mode: DAMAGE
+  border-change-after-seconds: 180
+  border-change-transition-seconds: 8
+  countdown-seconds: 5
+  lobby-teleport-on-join: true
+  max-players-by-spawns: false
+history:
+  max-matches-per-arena: 20

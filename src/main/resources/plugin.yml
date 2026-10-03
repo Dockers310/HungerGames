@@ -1,0 +1,12 @@
+name: HungerGames
+version: '${version}'
+main: ru.doksi.hungergames.HungerGamesPlugin
+author: Dok_Si
+description: HungerGames plugin for Paper and Folia with arenas, loot templates, collection mode, borders and GUI.
+api-version: '26.2'
+folia-supported: true
+commands:
+  hg:
+    description: HungerGames main command
+    usage: /hg
+    aliases: [hungergames]
