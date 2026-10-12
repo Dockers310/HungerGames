@@ -19,7 +19,9 @@ import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryOpenEvent;
+import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
@@ -27,6 +29,7 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.world.WorldLoadEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -79,6 +82,14 @@ public final class HungerGamesListener implements Listener {
         if (e.getInventory().getHolder() instanceof GuiHolder) return;
         Arena arena = arenaFor(p);
         if (arena == null) return;
+        if (arena.activePlayers().contains(p.getUniqueId())) {
+            // Через эндер-сундук игровой лут можно было бы вынести из матча в личное хранилище.
+            if (e.getInventory().getType() == InventoryType.ENDER_CHEST && !plugin.getAccessManager().hasAccess(p)) {
+                e.setCancelled(true);
+                plugin.send(p, "enderchest-locked");
+            }
+            return;
+        }
         boolean preGameParticipant = (arena.state() == ArenaState.WAITING || arena.state() == ArenaState.COUNTDOWN)
                 && arena.participants().contains(p.getUniqueId());
         if (!preGameParticipant) return;
@@ -87,6 +98,30 @@ public final class HungerGamesListener implements Listener {
             e.setCancelled(true);
             plugin.send(p, "chests-locked");
         }
+    }
+
+    /** Во время матча участнику доступны только команды из списка match-commands.allowed. */
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onCommand(PlayerCommandPreprocessEvent e) {
+        Player p = e.getPlayer();
+        if (!plugin.getGameManager().isInActiveGame(p.getUniqueId())) return;
+        if (!plugin.getConfig().getBoolean("match-commands.restrict", true)) return;
+        if (plugin.getAccessManager().hasAccess(p)) return;
+        String label = e.getMessage().startsWith("/") ? e.getMessage().substring(1) : e.getMessage();
+        label = label.trim().split("\\s+", 2)[0].toLowerCase(Locale.ROOT);
+        int namespace = label.indexOf(':');
+        if (namespace >= 0) label = label.substring(namespace + 1);
+        for (String allowed : plugin.getConfig().getStringList("match-commands.allowed")) {
+            if (allowed.equalsIgnoreCase(label)) return;
+        }
+        e.setCancelled(true);
+        plugin.send(p, "match-command-blocked");
+    }
+
+    @EventHandler
+    public void onWorldLoad(WorldLoadEvent e) {
+        plugin.getArenaManager().resolveWorld(e.getWorld());
+        plugin.clearDirtyContainers();
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)
@@ -156,8 +191,8 @@ public final class HungerGamesListener implements Listener {
         if (type != null && e.getAction() == Action.LEFT_CLICK_BLOCK && plugin.getChestManager().isLootContainer(block)) {
             Arena arena = plugin.getArenaManager().get(plugin.getSelectedArena(p.getUniqueId()));
             if (arena != null && plugin.getChestManager().template(type) != null) {
-                plugin.getChestManager().setContainer(arena, block, type);
-                plugin.send(p, "chest-assigned", "type", type);
+                if (plugin.getChestManager().setContainer(arena, block, type)) plugin.send(p, "chest-assigned", "type", type);
+                else plugin.send(p, "container-outside-arena");
                 e.setCancelled(true);
                 return;
             }
@@ -281,7 +316,9 @@ public final class HungerGamesListener implements Listener {
             if (slot != null && slot >= 0 && slot < arena.spawns().size()) {
                 Location spawn = arena.spawns().get(slot);
                 boolean positionChanged = e.getFrom().getX() != e.getTo().getX() || e.getFrom().getY() != e.getTo().getY() || e.getFrom().getZ() != e.getTo().getZ();
-                if (positionChanged) e.setTo(new Location(e.getFrom().getWorld(), spawn.getX(), spawn.getY(), spawn.getZ(), e.getTo().getYaw(), e.getTo().getPitch()));
+                // Пока игрок ещё не перенесён в мир арены, координаты точки к его миру не относятся.
+                boolean inArenaWorld = spawn.getWorld() != null && spawn.getWorld().equals(e.getFrom().getWorld());
+                if (positionChanged && inArenaWorld) e.setTo(new Location(e.getFrom().getWorld(), spawn.getX(), spawn.getY(), spawn.getZ(), e.getTo().getYaw(), e.getTo().getPitch()));
             }
             return;
         }
@@ -345,9 +382,7 @@ public final class HungerGamesListener implements Listener {
         if (destination == null) return;
 
         for (Arena arena : plugin.getArenaManager().all()) {
-            if (arena.state() == ArenaState.WAITING || arena.state() == ArenaState.FINISH || arena.state() == ArenaState.STOPPED) continue;
-            boolean active = arena.activePlayers().contains(p.getUniqueId());
-            boolean observer = plugin.getGameManager().isObserver(p.getUniqueId(), arena);
+            // Записанный участник не покидает свою точку и во время сбора, и во время отсчёта.
             boolean preGameParticipant = (arena.state() == ArenaState.WAITING || arena.state() == ArenaState.COUNTDOWN)
                     && arena.participants().contains(p.getUniqueId());
             if (preGameParticipant) {
@@ -355,6 +390,9 @@ public final class HungerGamesListener implements Listener {
                 plugin.send(p, "countdown-frozen");
                 return;
             }
+            if (arena.state() == ArenaState.WAITING || arena.state() == ArenaState.FINISH || arena.state() == ArenaState.STOPPED) continue;
+            boolean active = arena.activePlayers().contains(p.getUniqueId());
+            boolean observer = plugin.getGameManager().isObserver(p.getUniqueId(), arena);
             if (active || observer) {
                 if (!arena.insideOuter(destination)) {
                     e.setTo(arena.clampToOuter(destination));
@@ -450,10 +488,8 @@ public final class HungerGamesListener implements Listener {
         Player p = e.getPlayer();
         DeathInfo death = pendingDeaths.get(p.getUniqueId());
         if (death != null) {
-            var session = plugin.getGameManager().liveSession(death.arena());
-            if (session != null && session.snapshots().containsKey(p.getUniqueId())) {
-                e.setRespawnLocation(session.snapshots().get(p.getUniqueId()).location());
-            }
+            Location back = plugin.getGameManager().returnLocation(death.arena(), p.getUniqueId());
+            if (back != null) e.setRespawnLocation(back);
 
             // PlayerPostRespawnEvent есть не во всех сборках/сценариях одинаково.
             // Поэтому оставляем надёжный резерв: если post-respawn не придёт,
@@ -475,8 +511,13 @@ public final class HungerGamesListener implements Listener {
     private void processPendingDeath(Player p) {
         if (p == null) return;
         DeathInfo death = pendingDeaths.remove(p.getUniqueId());
-        if (death == null) return;
+        if (death == null) {
+            plugin.getGameManager().handlePostRespawn(p);
+            return;
+        }
         plugin.getGameManager().eliminate(p, death.arena(), death.reason(), death.killer(), death.killerUuid(), false);
+        // Если игру остановили, пока игрок был мёртв, вещи возвращаются после возрождения.
+        plugin.getGameManager().handlePostRespawn(p);
     }
 
     @EventHandler

@@ -10,3 +10,7 @@ commands:
     description: HungerGames main command
     usage: /hg
     aliases: [hungergames]
+permissions:
+  hungergames.admin:
+    description: Полный доступ к управлению HungerGames без записи в access.yml
+    default: op

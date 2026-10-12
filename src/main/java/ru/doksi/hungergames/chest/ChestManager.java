@@ -11,24 +11,29 @@ import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import ru.doksi.hungergames.HungerGamesPlugin;
 import ru.doksi.hungergames.arena.Arena;
+import ru.doksi.hungergames.util.SafeFiles;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class ChestManager {
     private final HungerGamesPlugin plugin;
-    private final Map<String, ChestTemplate> templates = new LinkedHashMap<>();
-    private final Map<String, Map<String, String>> arenaChests = new java.util.concurrent.ConcurrentHashMap<>();
+    // Шаблоны читаются из глобального цикла матчей и меняются из GUI в потоках сотрудников.
+    private final Map<String, ChestTemplate> templates = Collections.synchronizedMap(new LinkedHashMap<>());
+    private final Map<String, Map<String, String>> arenaChests = new ConcurrentHashMap<>();
+    private final Set<String> warnedOutside = ConcurrentHashMap.newKeySet();
+    /** Контейнер в стене арены игрок достаёт изнутри, поэтому допускается небольшой запас за границей. */
+    private static final double CONTAINER_MARGIN = 6.0;
     private File file;
-    private YamlConfiguration config;
 
     public ChestManager(HungerGamesPlugin plugin) { this.plugin = plugin; }
 
-    public void load() {
+    public synchronized void load() {
         templates.clear(); arenaChests.clear();
         file = new File(plugin.getDataFolder(), "chests.yml");
-        config = YamlConfiguration.loadConfiguration(file);
+        YamlConfiguration config = YamlConfiguration.loadConfiguration(file);
         ConfigurationSection root = config.getConfigurationSection("templates");
         if (root != null) {
             for (String id : root.getKeys(false)) {
@@ -53,22 +58,24 @@ public final class ChestManager {
             for (String arenaId : arenas.getKeys(false)) {
                 ConfigurationSection section = arenas.getConfigurationSection(arenaId);
                 if (section == null) continue;
-                Map<String, String> map = new LinkedHashMap<>();
+                Map<String, String> map = new ConcurrentHashMap<>();
                 for (String key : section.getKeys(false)) map.put(key, section.getString(key, "common"));
                 arenaChests.put(arenaId.toLowerCase(Locale.ROOT), map);
             }
         }
+        boolean changed = remapWorldKeys();
         if (!templates.containsKey("common")) {
             ChestTemplate common = new ChestTemplate("common", "Обычный", Material.CHEST);
             templates.put("common", common);
-            save();
+            changed = true;
         }
+        if (changed) save();
     }
 
-    public void save() {
-        if (config == null) config = new YamlConfiguration();
-        config.set("templates", null);
-        for (ChestTemplate t : templates.values()) {
+    public synchronized void save() {
+        if (file == null) file = new File(plugin.getDataFolder(), "chests.yml");
+        YamlConfiguration config = new YamlConfiguration();
+        for (ChestTemplate t : templates()) {
             String base = "templates." + t.id();
             config.set(base + ".display-name", t.displayName());
             config.set(base + ".icon", t.icon().name());
@@ -79,27 +86,28 @@ public final class ChestManager {
             for (ItemStack item : t.items()) if (item != null && !item.getType().isAir()) itemMaps.add(item.serialize());
             config.set(base + ".items", itemMaps);
         }
-        config.set("arena-chests", null);
         for (Map.Entry<String, Map<String, String>> e : arenaChests.entrySet()) {
             for (Map.Entry<String, String> chest : e.getValue().entrySet()) config.set("arena-chests." + e.getKey() + "." + chest.getKey(), chest.getValue());
         }
-        try { config.save(file); } catch (IOException e) { plugin.getLogger().severe("Could not save chests.yml: " + e.getMessage()); }
+        try { SafeFiles.saveYaml(config, file); } catch (IOException e) { plugin.getLogger().severe("Could not save chests.yml: " + e.getMessage()); }
     }
 
-    public Collection<ChestTemplate> templates() { return Collections.unmodifiableCollection(templates.values()); }
+    public Collection<ChestTemplate> templates() {
+        synchronized (templates) { return List.copyOf(templates.values()); }
+    }
     public ChestTemplate template(String id) { return id == null ? null : templates.get(id.toLowerCase(Locale.ROOT)); }
     public ChestTemplate createTemplate(String id) {
         String key = id.toLowerCase(Locale.ROOT);
-        if (templates.containsKey(key)) return null;
-        ChestTemplate t = new ChestTemplate(key, id, Material.CHEST); templates.put(key, t); save(); return t;
+        ChestTemplate t = new ChestTemplate(key, id, Material.CHEST);
+        if (templates.putIfAbsent(key, t) != null) return null;
+        save(); return t;
     }
 
     /** Deletes a custom loot template and removes it from all container assignments. */
     public boolean deleteTemplate(String id) {
         if (id == null) return false;
         String key = id.toLowerCase(Locale.ROOT);
-        if (!templates.containsKey(key) || key.equals("common")) return false;
-        templates.remove(key);
+        if (key.equals("common") || templates.remove(key) == null) return false;
         for (Map<String, String> map : arenaChests.values()) {
             map.entrySet().removeIf(entry -> key.equalsIgnoreCase(entry.getValue()));
         }
@@ -107,15 +115,21 @@ public final class ChestManager {
         return true;
     }
 
-    /** Assigns a loot template to any supported block inventory. */
-    public void setContainer(Arena arena, Block block, String type) {
-        if (arena == null || block == null || type == null || template(type) == null || !isLootContainer(block)) return;
-        arenaChests.computeIfAbsent(arena.id().toLowerCase(Locale.ROOT), k -> new LinkedHashMap<>()).put(chestKey(block), type.toLowerCase(Locale.ROOT));
+    /**
+     * Assigns a loot template to any supported block inventory.
+     * Контейнер должен находиться внутри границ арены: при заполнении и остановке матча его
+     * содержимое очищается, поэтому чужой сундук за пределами арены назначить нельзя.
+     */
+    public boolean setContainer(Arena arena, Block block, String type) {
+        if (arena == null || block == null || type == null || template(type) == null || !isLootContainer(block)) return false;
+        if (!arena.insideOuter(block.getLocation(), CONTAINER_MARGIN)) return false;
+        arenaChests.computeIfAbsent(arena.id().toLowerCase(Locale.ROOT), k -> new ConcurrentHashMap<>()).put(chestKey(block), type.toLowerCase(Locale.ROOT));
         save();
+        return true;
     }
 
     /** Backwards-compatible alias. */
-    public void setChest(Arena arena, Block block, String type) { setContainer(arena, block, type); }
+    public boolean setChest(Arena arena, Block block, String type) { return setContainer(arena, block, type); }
 
     public void removeContainer(Arena arena, Block block) {
         Map<String,String> map = arenaChests.get(arena.id().toLowerCase(Locale.ROOT));
@@ -185,10 +199,10 @@ public final class ChestManager {
 
     public void refill(Arena arena) {
         Map<String,String> map = arenaChests.get(arena.id().toLowerCase(Locale.ROOT));
-        if (map == null) return;
+        if (map == null || !plugin.isEnabled()) return;
         for (Map.Entry<String,String> entry : new ArrayList<>(map.entrySet())) {
             ContainerLocation target = parseKey(entry.getKey());
-            if (target == null) continue;
+            if (target == null || !insideArena(arena, target, entry.getKey())) continue;
             ChestTemplate template = template(entry.getValue());
             if (template == null) continue;
             plugin.getServer().getRegionScheduler().run(plugin, target.world, target.chunkX(), target.chunkZ(), ignored -> {
@@ -211,18 +225,56 @@ public final class ChestManager {
 
     /** Clears every registered loot container on the arena after a match ends/stops. */
     public void clearContainers(Arena arena) {
-        if (arena == null) return;
+        if (arena == null || !plugin.isEnabled()) return;
         Map<String,String> map = arenaChests.get(arena.id().toLowerCase(Locale.ROOT));
         if (map == null) return;
         for (String key : new ArrayList<>(map.keySet())) {
             ContainerLocation target = parseKey(key);
-            if (target == null) continue;
+            if (target == null || !insideArena(arena, target, key)) continue;
             plugin.getServer().getRegionScheduler().run(plugin, target.world, target.chunkX(), target.chunkZ(), ignored -> {
                 Block block = target.world.getBlockAt(target.x, target.y, target.z);
                 Inventory inv = getContainerInventory(block);
                 if (inv != null) inv.clear();
             });
         }
+    }
+
+    /**
+     * После сброса карты арены у мира меняется UID, а ключи контейнеров содержат старый.
+     * Переносит такие ключи на текущий мир арены.
+     */
+    public synchronized void remapWorlds() {
+        if (remapWorldKeys()) save();
+    }
+
+    private boolean remapWorldKeys() {
+        boolean changed = false;
+        for (Map.Entry<String, Map<String, String>> entry : arenaChests.entrySet()) {
+            Arena arena = plugin.getArenaManager() == null ? null : plugin.getArenaManager().get(entry.getKey());
+            UUID current = arena == null ? null : arena.worldUid();
+            if (current == null || Bukkit.getWorld(current) == null) continue;
+            for (String key : new ArrayList<>(entry.getValue().keySet())) {
+                String[] split = key.split(":", 2);
+                if (split.length != 2) continue;
+                UUID uid;
+                try { uid = UUID.fromString(split[0]); } catch (IllegalArgumentException e) { continue; }
+                if (uid.equals(current) || Bukkit.getWorld(uid) != null) continue;
+                String type = entry.getValue().remove(key);
+                if (type != null) entry.getValue().put(current + ":" + split[1], type);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /** Старые назначения за пределами арены не заполняются и не очищаются. */
+    private boolean insideArena(Arena arena, ContainerLocation target, String key) {
+        if (arena.insideOuter(new Location(target.world, target.x, target.y, target.z), CONTAINER_MARGIN)) return true;
+        if (warnedOutside.add(arena.id() + "|" + key)) {
+            plugin.getLogger().warning("Арена " + arena.id() + ": контейнер " + target.x + " " + target.y + " " + target.z
+                    + " находится за границами арены и пропущен. Снимите назначение или расширьте границы.");
+        }
+        return false;
     }
 
     private String chestKey(Block block) {

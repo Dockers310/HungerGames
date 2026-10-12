@@ -8,6 +8,7 @@ import org.bukkit.entity.Player;
 import ru.doksi.hungergames.HungerGamesPlugin;
 import ru.doksi.hungergames.arena.Arena;
 import ru.doksi.hungergames.arena.BorderMode;
+import ru.doksi.hungergames.game.GameManager;
 
 import java.util.*;
 
@@ -97,7 +98,10 @@ public final class HungerGamesCommand implements CommandExecutor, TabCompleter {
             plugin.selectArena(player.getUniqueId(), arena.id()); plugin.send(player, "arena-created", "arena", arena.id());
         } else if (op.equals("удалить") || op.equals("delete")) {
             if (args.length < 3) return;
-            if (plugin.getArenaManager().delete(args[2])) { plugin.getChestManager().removeArena(args[2]); plugin.send(player, "arena-deleted", "arena", args[2]); }
+            Arena arena = plugin.getArenaManager().get(args[2]); if (arena == null) { plugin.send(player, "unknown-arena", "arena", args[2]); return; }
+            // Арену с идущей игрой удалять нельзя: участники остались бы без вещей и без матча.
+            if (plugin.getGameManager().deleteArena(arena)) plugin.send(player, "arena-deleted", "arena", arena.id());
+            else plugin.send(player, "arena-busy", "arena", arena.id());
         } else if (op.equals("выбрать") || op.equals("select")) {
             if (args.length < 3) return;
             Arena arena = plugin.getArenaManager().get(args[2]); if (arena == null) { plugin.send(player, "unknown-arena", "arena", args[2]); return; }
@@ -160,31 +164,23 @@ public final class HungerGamesCommand implements CommandExecutor, TabCompleter {
         String op = args[1].toLowerCase(Locale.ROOT);
         if (op.equals("добавить") || op.equals("add")) {
             if (args.length < 3) { plugin.send(p, "usage-participant-add"); return; }
-            if (arena.state() != ru.doksi.hungergames.arena.ArenaState.WAITING) { plugin.send(p, "participants-locked"); return; }
             org.bukkit.OfflinePlayer target = Bukkit.getOfflinePlayer(args[2]);
-            if (arena.participants().contains(target.getUniqueId())) { plugin.send(p, "already-participant-target", "player", args[2]); return; }
-            int freeSlot = plugin.getGameManager().assignParticipantSpawn(arena, target.getUniqueId());
-            if (arena.participants().size() >= arena.maxPlayers() || freeSlot < 0) { plugin.send(p, "join-full"); return; }
-            arena.participants().add(target.getUniqueId());
-            Player targetPlayer = plugin.getGameManager().getOnlinePlayer(target.getUniqueId());
-            if (targetPlayer != null) {
-                targetPlayer.getScheduler().run(plugin, ignored -> {
-                    plugin.getGameManager().rememberParticipantState(targetPlayer);
-                    plugin.getGameManager().teleportParticipantToAssignedSpawn(targetPlayer, arena);
-                    plugin.send(targetPlayer, "participant-added-you", "arena", arena.id());
-                }, null);
+            String targetName = target.getName() == null ? args[2] : target.getName();
+            switch (plugin.getGameManager().addParticipant(arena, target.getUniqueId())) {
+                case OK -> plugin.send(p, "participant-added", "player", targetName);
+                case LOCKED -> plugin.send(p, "participants-locked");
+                case ALREADY -> plugin.send(p, "already-participant-target", "player", args[2]);
+                case IN_OTHER_ARENA -> plugin.send(p, "target-in-other-arena", "player", targetName);
+                case NO_SLOT -> plugin.send(p, "no-spawn-slots");
+                default -> plugin.send(p, "join-full");
             }
-            plugin.getArenaManager().save();
-            plugin.send(p, "participant-added", "player", target.getName() == null ? args[2] : target.getName());
         } else if (op.equals("убрать") || op.equals("remove")) {
             if (args.length < 3) { plugin.send(p, "usage-participant-remove"); return; }
-            if (arena.state() != ru.doksi.hungergames.arena.ArenaState.WAITING) { plugin.send(p, "participants-locked"); return; }
             org.bukkit.OfflinePlayer target = Bukkit.getOfflinePlayer(args[2]);
-            if (arena.participants().remove(target.getUniqueId())) {
-                arena.clearSpawnSlot(target.getUniqueId());
-                plugin.getArenaManager().save();
-                plugin.send(p, "participant-removed", "player", target.getName() == null ? args[2] : target.getName());
-            } else plugin.send(p, "not-participant-target", "player", args[2]);
+            GameManager.ParticipantChange result = plugin.getGameManager().removeParticipant(arena, target.getUniqueId());
+            if (result == GameManager.ParticipantChange.OK) plugin.send(p, "participant-removed", "player", target.getName() == null ? args[2] : target.getName());
+            else if (result == GameManager.ParticipantChange.LOCKED) plugin.send(p, "participants-locked");
+            else plugin.send(p, "not-participant-target", "player", args[2]);
         } else {
             plugin.getGuiManager().openParticipants(p, arena);
         }
@@ -199,7 +195,8 @@ public final class HungerGamesCommand implements CommandExecutor, TabCompleter {
         if (args.length >= 3 && args[1].equalsIgnoreCase("тип") || args.length >= 3 && args[1].equalsIgnoreCase("type")) {
             Block block = p.getTargetBlockExact(6); if (block == null || !plugin.getChestManager().isLootContainer(block)) { plugin.send(p, "chest-not-found"); return; }
             if (plugin.getChestManager().template(args[2]) == null) { plugin.send(p, "template-not-found", "type", args[2]); return; }
-            plugin.getChestManager().setContainer(arena, block, args[2]); plugin.send(p, "chest-assigned", "type", args[2]);
+            if (plugin.getChestManager().setContainer(arena, block, args[2])) plugin.send(p, "chest-assigned", "type", args[2]);
+            else plugin.send(p, "container-outside-arena");
         } else if (args.length >= 2 && (args[1].equalsIgnoreCase("снять") || args[1].equalsIgnoreCase("remove"))) {
             Block block = p.getTargetBlockExact(6); if (block == null) { plugin.send(p, "chest-not-found"); return; }
             plugin.getChestManager().removeChest(arena, block); plugin.send(p, "chest-unassigned");
@@ -260,11 +257,14 @@ public final class HungerGamesCommand implements CommandExecutor, TabCompleter {
         String op = args[1].toLowerCase(Locale.ROOT);
         if (op.equals("добавить") || op.equals("add")) {
             if (args.length < 3) return;
-            if (!plugin.getAccessManager().add(args[2])) { plugin.send(p, "access-creator-protected"); return; }
+            if (!plugin.getAccessManager().add(args[2])) { plugin.send(p, "access-add-failed", "player", args[2]); return; }
             plugin.send(p, "access-added", "player", args[2]);
         } else if (op.equals("убрать") || op.equals("remove")) {
             if (args.length < 3) return;
-            if (!plugin.getAccessManager().remove(args[2])) { plugin.send(p, "access-remove-failed", "player", args[2]); return; }
+            boolean removed = plugin.getAccessManager().remove(args[2]);
+            // Доступ по нику задаётся в config.yml и командой не снимается.
+            if (plugin.getAccessManager().isCreatorName(args[2])) { plugin.send(p, "access-by-name", "player", args[2]); return; }
+            if (!removed) { plugin.send(p, "access-remove-failed", "player", args[2]); return; }
             plugin.send(p, "access-removed", "player", args[2]);
         } else if (op.equals("список") || op.equals("list")) plugin.getGuiManager().openAccess(p);
     }

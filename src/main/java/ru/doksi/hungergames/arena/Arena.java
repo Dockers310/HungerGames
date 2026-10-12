@@ -5,59 +5,67 @@ import org.bukkit.Location;
 import org.bukkit.World;
 import ru.doksi.hungergames.HungerGamesPlugin;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CopyOnWriteArraySet;
 
+/**
+ * Арена читается из потоков разных регионов Folia (события игроков) и из глобального цикла матчей,
+ * поэтому все поля либо volatile, либо потокобезопасные коллекции. Составные изменения
+ * (вход, выход, старт, выбывание, остановка) выполняет GameManager под общим замком.
+ */
 public final class Arena {
     public static final class Settings {
-        public int minPlayers;
-        public int maxPlayers;
-        public long protectionSeconds;
-        public long chestRefillSeconds;
-        public long shrinkStartDelaySeconds;
-        public long shrinkStageDurationSeconds;
-        public int shrinkStages;
-        public double shrinkFinalRatio;
-        public double borderDamageHeartMultiplier;
-        public BorderMode borderMode;
-        public BorderMode changingStartMode;
-        public BorderMode changingTargetMode;
-        public long borderChangeAfterSeconds;
-        public long borderChangeTransitionSeconds;
-        public int countdownSeconds;
-        public boolean lobbyTeleportOnJoin;
-        public boolean maxPlayersBySpawns;
+        public volatile int minPlayers;
+        public volatile int maxPlayers;
+        public volatile long protectionSeconds;
+        public volatile long chestRefillSeconds;
+        public volatile long shrinkStartDelaySeconds;
+        public volatile long shrinkStageDurationSeconds;
+        public volatile int shrinkStages;
+        public volatile double shrinkFinalRatio;
+        public volatile double borderDamageHeartMultiplier;
+        public volatile BorderMode borderMode;
+        public volatile BorderMode changingStartMode;
+        public volatile BorderMode changingTargetMode;
+        public volatile long borderChangeAfterSeconds;
+        public volatile long borderChangeTransitionSeconds;
+        public volatile int countdownSeconds;
+        public volatile boolean lobbyTeleportOnJoin;
+        public volatile boolean maxPlayersBySpawns;
     }
 
     private final String id;
-    private String worldName;
-    private UUID worldUid;
-    private Location pos1;
-    private Location pos2;
-    private Location lobby;
-    private final List<Location> spawns = new ArrayList<>();
-    private final Map<UUID, Integer> spawnSlots = new LinkedHashMap<>();
-    private final Set<UUID> participants = new LinkedHashSet<>();
-    private final Set<UUID> activePlayers = new LinkedHashSet<>();
-    private final Set<UUID> spectators = new LinkedHashSet<>();
-    private int minPlayers;
-    private int maxPlayers;
+    private volatile String worldName;
+    private volatile UUID worldUid;
+    private volatile Location pos1;
+    private volatile Location pos2;
+    private volatile Location lobby;
+    private final List<Location> spawns = new CopyOnWriteArrayList<>();
+    private final Map<UUID, Integer> spawnSlots = new ConcurrentHashMap<>();
+    // CopyOnWriteArraySet сохраняет порядок записи участников; списки небольшие.
+    private final Set<UUID> participants = new CopyOnWriteArraySet<>();
+    private final Set<UUID> activePlayers = new CopyOnWriteArraySet<>();
+    private final Set<UUID> spectators = new CopyOnWriteArraySet<>();
+    private volatile int minPlayers;
+    private volatile int maxPlayers;
     private final Settings settings = new Settings();
-    private ArenaState state = ArenaState.WAITING;
-    private boolean collecting;
-    private long phaseStartedAt;
-    private long lastRefillAt;
-    private double shrinkStartHalfX;
-    private double shrinkStartHalfZ;
-    private double shrinkFinalHalfX;
-    private double shrinkFinalHalfZ;
-    private int currentShrinkStage;
-    private long borderChangeStartedAtMillis;
+    private volatile ArenaState state = ArenaState.WAITING;
+    private volatile boolean collecting;
+    private volatile long phaseStartedAt;
+    private volatile long lastRefillAt;
+    private volatile double shrinkStartHalfX;
+    private volatile double shrinkStartHalfZ;
+    private volatile double shrinkFinalHalfX;
+    private volatile double shrinkFinalHalfZ;
+    private volatile int currentShrinkStage;
+    private volatile long borderChangeStartedAtMillis;
+    // В контейнерах арены может лежать лут незавершённого матча (сервер остановлен во время игры).
+    private volatile boolean containersDirty;
 
     public Arena(String id, String worldName, UUID worldUid) {
         this.id = id;
@@ -93,9 +101,9 @@ public final class Arena {
     public String worldName() { return worldName; }
     public UUID worldUid() { return worldUid; }
     public void setWorld(World world) { this.worldName = world.getName(); this.worldUid = world.getUID(); }
-    public Location pos1() { return pos1 == null ? null : pos1.clone(); }
-    public Location pos2() { return pos2 == null ? null : pos2.clone(); }
-    public Location lobby() { return lobby == null ? null : lobby.clone(); }
+    public Location pos1() { Location pos1 = this.pos1; return pos1 == null ? null : pos1.clone(); }
+    public Location pos2() { Location pos2 = this.pos2; return pos2 == null ? null : pos2.clone(); }
+    public Location lobby() { Location lobby = this.lobby; return lobby == null ? null : lobby.clone(); }
     public List<Location> spawns() { return spawns.stream().map(Location::clone).toList(); }
     public List<Location> mutableSpawns() { return spawns; }
     public Map<UUID, Integer> spawnSlots() { return spawnSlots; }
@@ -195,11 +203,14 @@ public final class Arena {
     }
     public ArenaState state() { return state; }
     public void setState(ArenaState state) {
-        this.state = state;
+        // Сначала время, затем состояние: другой поток не должен увидеть новую фазу со старым временем.
         this.phaseStartedAt = System.currentTimeMillis();
+        this.state = state;
         if (state == ArenaState.GAME && settings.borderMode == BorderMode.CHANGING) startBorderChangeClock();
     }
     public boolean collecting() { return collecting; }
+    public boolean containersDirty() { return containersDirty; }
+    public void setContainersDirty(boolean value) { containersDirty = value; }
     public void setCollecting(boolean collecting) { this.collecting = collecting; }
     public long phaseElapsedSeconds() { return Math.max(0L, (System.currentTimeMillis() - phaseStartedAt) / 1000L); }
     public void markRefillNow() { lastRefillAt = System.currentTimeMillis(); }
@@ -217,6 +228,7 @@ public final class Arena {
         borderChangeStartedAtMillis = 0;
     }
     public void prepareShrink() {
+        Location pos1 = this.pos1, pos2 = this.pos2;
         if (pos1 == null || pos2 == null) return;
         shrinkStartHalfX = Math.max(1.0, Math.abs(pos2.getX() - pos1.getX()) / 2.0);
         shrinkStartHalfZ = Math.max(1.0, Math.abs(pos2.getZ() - pos1.getZ()) / 2.0);
@@ -225,10 +237,10 @@ public final class Arena {
     }
     public int currentShrinkStage() { return currentShrinkStage; }
     public void setCurrentShrinkStage(int stage) { currentShrinkStage = stage; }
-    public double centerX() { return (pos1.getX() + pos2.getX()) / 2.0; }
-    public double centerZ() { return (pos1.getZ() + pos2.getZ()) / 2.0; }
-    public double shrinkCenterX() { return lobby == null ? centerX() : lobby.getX(); }
-    public double shrinkCenterZ() { return lobby == null ? centerZ() : lobby.getZ(); }
+    public double centerX() { Location pos1 = this.pos1, pos2 = this.pos2; return pos1 == null || pos2 == null ? 0.0 : (pos1.getX() + pos2.getX()) / 2.0; }
+    public double centerZ() { Location pos1 = this.pos1, pos2 = this.pos2; return pos1 == null || pos2 == null ? 0.0 : (pos1.getZ() + pos2.getZ()) / 2.0; }
+    public double shrinkCenterX() { Location lobby = this.lobby; return lobby == null ? centerX() : lobby.getX(); }
+    public double shrinkCenterZ() { Location lobby = this.lobby; return lobby == null ? centerZ() : lobby.getZ(); }
     public double currentHalfX() {
         if (state != ArenaState.GAME || settings.shrinkStages <= 0) return shrinkStartHalfX;
         return currentHalfXAtProgress(Math.min(1.0, progressOfShrink()));
@@ -250,6 +262,7 @@ public final class Arena {
         return state == ArenaState.GAME && phaseElapsedSeconds() >= settings.shrinkStartDelaySeconds;
     }
     public Location clampToShrink(Location input) {
+        Location pos1 = this.pos1, pos2 = this.pos2;
         if (input == null || pos1 == null || pos2 == null) return input == null ? null : input.clone();
         double inset = 0.20;
         double minX = shrinkCenterX() - Math.max(0.25, currentHalfX() - inset);
@@ -262,12 +275,18 @@ public final class Arena {
         return out;
     }
     public double outsideDistance(Location loc) {
+        Location pos1 = this.pos1, pos2 = this.pos2;
         if (pos1 == null || pos2 == null) return 0.0;
         double dx = Math.max(0.0, Math.abs(loc.getX() - shrinkCenterX()) - currentHalfX());
         double dz = Math.max(0.0, Math.abs(loc.getZ() - shrinkCenterZ()) - currentHalfZ());
         return Math.max(dx, dz);
     }
-    public boolean insideOuter(Location loc) {
+    public boolean insideOuter(Location loc) { return insideOuter(loc, 0.0); }
+
+    /** @param margin запас в блоках вокруг границ арены */
+    public boolean insideOuter(Location loc, double margin) {
+        Location pos1 = this.pos1, pos2 = this.pos2;
+        UUID worldUid = this.worldUid;
         if (pos1 == null || pos2 == null || loc.getWorld() == null) return false;
         if (worldUid != null && !worldUid.equals(loc.getWorld().getUID())) return false;
         double minX = Math.min(pos1.getX(), pos2.getX());
@@ -276,9 +295,11 @@ public final class Arena {
         double maxY = Math.max(pos1.getY(), pos2.getY());
         double minZ = Math.min(pos1.getZ(), pos2.getZ());
         double maxZ = Math.max(pos1.getZ(), pos2.getZ());
-        return loc.getX() >= minX && loc.getX() <= maxX && loc.getY() >= minY && loc.getY() <= maxY && loc.getZ() >= minZ && loc.getZ() <= maxZ;
+        return loc.getX() >= minX - margin && loc.getX() <= maxX + margin && loc.getY() >= minY - margin && loc.getY() <= maxY + margin
+                && loc.getZ() >= minZ - margin && loc.getZ() <= maxZ + margin;
     }
     public Location clampToOuter(Location input) {
+        Location pos1 = this.pos1, pos2 = this.pos2;
         if (pos1 == null || pos2 == null) return input.clone();
         double minX = Math.min(pos1.getX(), pos2.getX());
         double maxX = Math.max(pos1.getX(), pos2.getX());
@@ -293,7 +314,9 @@ public final class Arena {
         return out;
     }
     public Location shrinkCenterLocation() {
-        World world = Bukkit.getWorld(worldUid);
+        Location pos1 = this.pos1, lobby = this.lobby;
+        UUID worldUid = this.worldUid;
+        World world = worldUid == null ? null : Bukkit.getWorld(worldUid);
         if (world == null) return null;
         double y = lobby != null ? lobby.getY() : (pos1 == null ? world.getMinHeight() + 1.0 : pos1.getY());
         return new Location(world, shrinkCenterX(), y, shrinkCenterZ());

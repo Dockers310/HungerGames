@@ -2,9 +2,7 @@ package ru.doksi.hungergames.game;
 
 import org.bukkit.Bukkit;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
-import org.bukkit.GameMode;
 import org.bukkit.Location;
-import org.bukkit.Material;
 import org.bukkit.Color;
 import org.bukkit.Particle;
 import org.bukkit.World;
@@ -20,12 +18,32 @@ import ru.doksi.hungergames.arena.ArenaState;
 import ru.doksi.hungergames.arena.BorderMode;
 import ru.doksi.hungergames.util.FoliaScheduler;
 
+import java.io.IOException;
 import java.util.*;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.logging.Level;
 
+/**
+ * Матчи и состав арен.
+ *
+ * Потоки (Folia): глобальный цикл {@link #tick()} и события игроков выполняются в разных потоках.
+ * Поэтому любое составное изменение состава или состояния арены делается под {@link #stateLock},
+ * а любое действие над игроком (инвентарь, режим, телепорт) — только в потоке этого игрока
+ * через {@link FoliaScheduler#entity}.
+ *
+ * Вещи игроков: инвентарь не трогается, пока идёт сбор. Снимок делается один раз, перед самым
+ * стартом матча, сразу записывается на диск ({@link RestoreStore}) и только после этого инвентарь
+ * очищается. Файл удаляется после возврата вещей.
+ */
 public final class GameManager {
+    /** Сколько секунд после конца отсчёта ждать участников, чьи вещи ещё не сохранены. */
+    private static final long PREPARE_GRACE_SECONDS = 3L;
+
+    public enum ParticipantChange { OK, LOCKED, ALREADY, IN_OTHER_ARENA, FULL, NO_SLOT, NOT_FOUND }
+
     private final HungerGamesPlugin plugin;
     private final FoliaScheduler scheduler;
+    private final RestoreStore restoreStore;
+    private final Object stateLock = new Object();
     private ScheduledTask taskId;
     private ScheduledTask particleTaskId;
     private final Set<UUID> pluginTeleports = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -34,19 +52,27 @@ public final class GameManager {
     private final Map<String, MatchSession> sessions = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<UUID, Arena> observers = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<UUID, ObserverState> observerStates = new java.util.concurrent.ConcurrentHashMap<>();
-    private final Map<UUID, PlayerSnapshot> participantPreGameSnapshots = new java.util.concurrent.ConcurrentHashMap<>();
-    private final Map<UUID, PlayerSnapshot> pendingRestores = new java.util.concurrent.ConcurrentHashMap<>();
+    // Место, откуда игрок пришёл на арену. Инвентарь во время сбора не сохраняется и не меняется.
+    private final Map<UUID, Location> returnLocations = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<UUID, Player> onlinePlayers = new java.util.concurrent.ConcurrentHashMap<>();
+    // Сотрудники онлайн; права проверяются в потоке самого игрока, здесь только результат.
+    private final Set<UUID> staffOnline = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private record ObserverState(Location returnLocation, org.bukkit.GameMode previousGameMode, boolean previousAllowFlight, boolean previousFlying) { }
     private final Map<UUID, ObserverState> pendingObserverRestores = new java.util.concurrent.ConcurrentHashMap<>();
 
-    public GameManager(HungerGamesPlugin plugin) { this.plugin = plugin; this.scheduler = new FoliaScheduler(plugin); }
+    public GameManager(HungerGamesPlugin plugin) {
+        this.plugin = plugin;
+        this.scheduler = new FoliaScheduler(plugin);
+        this.restoreStore = new RestoreStore(plugin);
+    }
 
     public static final class MatchSession {
         private final String id;
         private final long startedAt;
+        private volatile boolean started;
         private final Map<UUID, PlayerSnapshot> snapshots = new java.util.concurrent.ConcurrentHashMap<>();
+        private final Set<UUID> unavailable = java.util.concurrent.ConcurrentHashMap.newKeySet();
         private final Map<UUID, Integer> kills = new java.util.concurrent.ConcurrentHashMap<>();
         private final Map<UUID, MatchHistoryManager.Result> results = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -56,6 +82,8 @@ public final class GameManager {
         }
         public String id() { return id; }
         public long startedAt() { return startedAt; }
+        /** false, пока идёт сохранение вещей участников перед стартом. */
+        public boolean started() { return started; }
         public Map<UUID, PlayerSnapshot> snapshots() { return snapshots; }
         public int kills(UUID uuid) { return kills.getOrDefault(uuid, 0); }
         public void addKill(UUID uuid) { kills.merge(uuid, 1, Integer::sum); }
@@ -64,49 +92,102 @@ public final class GameManager {
         public boolean hasResult(UUID uuid) { return results.containsKey(uuid); }
     }
 
+    public void load() {
+        restoreStore.load();
+    }
+
     public void startTicker() {
         taskId = scheduler.globalRepeating(20L, 20L, this::tick);
-        particleTaskId = scheduler.globalRepeating(5L, 5L, () -> {
+        long period = Math.max(2L, plugin.getConfig().getLong("border-particles.period-ticks", 5L));
+        particleTaskId = scheduler.globalRepeating(period, period, () -> {
             for (Arena arena : plugin.getArenaManager().all()) renderBorderParticles(arena);
         });
     }
 
+    /**
+     * Вызывается из onDisable. Выключенный плагин не может ставить задачи, а трогать игроков
+     * из чужого потока нельзя, поэтому здесь нет действий над игроками: вещи участников
+     * незавершённого матча лежат в папке restore и возвращаются при следующем входе.
+     */
     public void shutdown() {
         if (taskId != null) taskId.cancel();
         if (particleTaskId != null) particleTaskId.cancel();
-        for (Arena arena : plugin.getArenaManager().all()) stop(arena, false);
-        for (Player player : new ArrayList<>(onlinePlayers.values())) {
-            if (player != null) {
-                scheduler.entity(player, () -> {
-                    if (!player.isOnline()) return;
-                    restorePending(player);
-                    leaveObserver(player);
-                });
+        synchronized (stateLock) {
+            for (Arena arena : plugin.getArenaManager().all()) {
+                MatchSession session = sessions.remove(arenaKey(arena));
+                if (session != null && session.started() && arena.state() != ArenaState.FINISH && !session.results().isEmpty()) {
+                    plugin.getMatchHistoryManager().record(arena.id(), session.id(), session.startedAt(), System.currentTimeMillis(), session.results());
+                }
+                clearArenaRuntime(arena);
             }
         }
-        participantPreGameSnapshots.clear();
+        for (BossBar bar : bossBars.values()) {
+            try { bar.removeAll(); } catch (RuntimeException ignored) { }
+        }
+        bossBars.clear();
+        bossBarViewers.clear();
+        observers.clear();
+        observerStates.clear();
+        returnLocations.clear();
+        staffOnline.clear();
         onlinePlayers.clear();
+        if (restoreStore.size() > 0) {
+            plugin.getLogger().info("Вещи " + restoreStore.size() + " игрок(ов) сохранены в папке restore и вернутся при входе.");
+        }
+    }
+
+    private void clearArenaRuntime(Arena arena) {
+        arena.activePlayers().clear();
+        arena.spectators().clear();
+        arena.participants().clear();
+        // После окончания матча все старые привязки игроков к точкам появления
+        // должны быть удалены. Иначе firstFreeSpawnSlot() считает старые точки занятыми
+        // и следующую игру на этой же арене начать невозможно.
+        arena.spawnSlots().clear();
+        arena.setState(ArenaState.WAITING);
+        arena.setCollecting(false);
     }
 
     private void tick() {
         for (Arena arena : plugin.getArenaManager().all()) {
-            switch (arena.state()) {
-                case COUNTDOWN -> tickCountdown(arena);
-                case PROTECTION -> tickProtection(arena);
-                case GAME -> tickGame(arena);
-                default -> { }
+            try {
+                synchronized (stateLock) {
+                    switch (arena.state()) {
+                        case COUNTDOWN -> tickCountdown(arena);
+                        case PROTECTION -> tickProtection(arena);
+                        case GAME -> tickGame(arena);
+                        default -> { }
+                    }
+                }
+            } catch (RuntimeException e) {
+                plugin.getLogger().log(Level.SEVERE, "Ошибка в цикле матча на арене " + arena.id(), e);
             }
         }
-        enforceBossBarsOnlyForActivePlayers();
         enforceAllNonParticipants();
     }
 
     private void tickCountdown(Arena arena) {
         long elapsed = arena.phaseElapsedSeconds();
-        long remaining = Math.max(0, arena.settings().countdownSeconds - elapsed);
+        long total = arena.settings().countdownSeconds;
+        long remaining = Math.max(0, total - elapsed);
         createOrUpdateBossBar(arena);
         if (remaining > 0 && remaining <= 5) broadcast(arena, "countdown", "seconds", remaining);
-        if (elapsed >= arena.settings().countdownSeconds) startMatch(arena);
+
+        MatchSession session = sessions.get(arenaKey(arena));
+        if (session == null) {
+            // За секунду до старта сохраняем вещи участников; матч начнётся следующим шагом.
+            if (elapsed >= total - 1) beginMatchPreparation(arena);
+            return;
+        }
+        if (elapsed < total) return;
+        boolean everyoneReady = true;
+        for (UUID uuid : arena.participants()) {
+            if (onlinePlayers.get(uuid) != null && !session.snapshots().containsKey(uuid) && !session.unavailable.contains(uuid)) {
+                everyoneReady = false;
+                break;
+            }
+        }
+        if (everyoneReady || elapsed >= total + PREPARE_GRACE_SECONDS) startMatch(arena, session);
     }
 
     private void tickProtection(Arena arena) {
@@ -310,67 +391,167 @@ public final class GameManager {
         return null;
     }
 
+    /** Запись игрока на арену. Вызывается из потока игрока. Инвентарь не сохраняется и не меняется. */
     public boolean join(Player player, Arena arena) {
         if (player == null || arena == null) return false;
-        if (arena.state() != ArenaState.WAITING || !arena.collecting()) { plugin.send(player, "join-open-only"); return false; }
-        if (arena.spawns().isEmpty()) { plugin.send(player, "no-spawn-slots"); return false; }
-        if (arena.participants().contains(player.getUniqueId())) { plugin.send(player, "already-participant"); return false; }
-        if (arena.participants().size() >= arena.maxPlayers()) { plugin.send(player, "join-full"); return false; }
-        if (findPlayerArena(player.getUniqueId()).isPresent()) { plugin.send(player, "already-in-other-arena"); return false; }
-        int freeSpawnIndex = arena.firstFreeSpawnSlot();
-        if (freeSpawnIndex < 0) { plugin.send(player, "no-spawn-slots"); return false; }
-        rememberParticipantState(player);
-        arena.participants().add(player.getUniqueId());
-        arena.assignSpawnSlot(player.getUniqueId(), freeSpawnIndex);
-        safeTeleport(player, arena.spawns().get(freeSpawnIndex));
+        UUID uuid = player.getUniqueId();
+        int freeSpawnIndex;
+        Location spawn;
+        boolean restoreFirst = false;
+        synchronized (stateLock) {
+            if (arena.state() != ArenaState.WAITING || !arena.collecting()) { plugin.send(player, "join-open-only"); return false; }
+            List<Location> spawns = arena.spawns();
+            if (spawns.isEmpty()) { plugin.send(player, "no-spawn-slots"); return false; }
+            if (arena.participants().contains(uuid)) { plugin.send(player, "already-participant"); return false; }
+            if (arena.participants().size() >= arena.maxPlayers()) { plugin.send(player, "join-full"); return false; }
+            if (findPlayerArena(uuid).isPresent()) { plugin.send(player, "already-in-other-arena"); return false; }
+            freeSpawnIndex = arena.firstFreeSpawnSlot();
+            if (freeSpawnIndex < 0 || freeSpawnIndex >= spawns.size()) { plugin.send(player, "no-spawn-slots"); return false; }
+            if (restoreStore.has(uuid)) {
+                // Вещи с прошлого матча ещё не возвращены. Сначала возврат, запись — следующей командой.
+                restoreFirst = true;
+                spawn = null;
+            } else {
+                spawn = spawns.get(freeSpawnIndex);
+                arena.participants().add(uuid);
+                arena.assignSpawnSlot(uuid, freeSpawnIndex);
+            }
+        }
+        if (restoreFirst) {
+            restoreIfPending(player, null, "restored-after-leave");
+            if (!restoreStore.has(uuid)) plugin.send(player, "restore-pending");
+            return false;
+        }
+        returnLocations.put(uuid, player.getLocation().clone());
+        safeTeleport(player, spawn);
         plugin.send(player, "joined", "arena", arena.id(), "slot", freeSpawnIndex + 1);
         plugin.getArenaManager().save();
         return true;
     }
 
-    public int assignParticipantSpawn(Arena arena, UUID uuid) {
+    /** Запись игрока сотрудником. Вызывается из потока сотрудника. */
+    public ParticipantChange addParticipant(Arena arena, UUID uuid) {
+        if (arena == null || uuid == null) return ParticipantChange.NOT_FOUND;
+        synchronized (stateLock) {
+            if (arena.state() != ArenaState.WAITING) return ParticipantChange.LOCKED;
+            if (arena.participants().contains(uuid)) return ParticipantChange.ALREADY;
+            if (findPlayerArena(uuid).isPresent()) return ParticipantChange.IN_OTHER_ARENA;
+            if (arena.participants().size() >= arena.maxPlayers()) return ParticipantChange.FULL;
+            int slot = arena.firstFreeSpawnSlot();
+            if (slot < 0) return ParticipantChange.NO_SLOT;
+            arena.participants().add(uuid);
+            arena.assignSpawnSlot(uuid, slot);
+        }
+        Player target = onlinePlayers.get(uuid);
+        if (target != null) {
+            scheduler.entity(target, () -> {
+                if (!target.isOnline() || !isWaitingParticipant(arena, uuid)) return;
+                returnLocations.put(uuid, target.getLocation().clone());
+                teleportParticipantToAssignedSpawn(target, arena);
+                plugin.send(target, "participant-added-you", "arena", arena.id());
+            });
+        }
+        plugin.getArenaManager().save();
+        return ParticipantChange.OK;
+    }
+
+    /** Удаление участника сотрудником во время сбора: игрок возвращается туда, откуда пришёл. */
+    public ParticipantChange removeParticipant(Arena arena, UUID uuid) {
+        if (arena == null || uuid == null) return ParticipantChange.NOT_FOUND;
+        synchronized (stateLock) {
+            if (arena.state() != ArenaState.WAITING) return ParticipantChange.LOCKED;
+            if (!arena.participants().remove(uuid)) return ParticipantChange.NOT_FOUND;
+            arena.clearSpawnSlot(uuid);
+        }
+        Player target = onlinePlayers.get(uuid);
+        if (target != null) {
+            scheduler.entity(target, () -> {
+                if (!target.isOnline()) return;
+                returnToPreviousPlace(target);
+                plugin.send(target, "participant-removed-you", "arena", arena.id());
+            });
+        }
+        plugin.getArenaManager().save();
+        return ParticipantChange.OK;
+    }
+
+    /** Удаление арены. Арену с идущей игрой удалить нельзя; записанные участники возвращаются. */
+    public boolean deleteArena(Arena arena) {
+        if (arena == null) return false;
+        synchronized (stateLock) {
+            if (arena.state() != ArenaState.WAITING) return false;
+            stop(arena, false);
+            if (!plugin.getArenaManager().delete(arena.id())) return false;
+        }
+        plugin.getChestManager().removeArena(arena.id());
+        return true;
+    }
+
+    private boolean isWaitingParticipant(Arena arena, UUID uuid) {
+        return (arena.state() == ArenaState.WAITING || arena.state() == ArenaState.COUNTDOWN) && arena.participants().contains(uuid);
+    }
+
+    private int assignParticipantSpawn(Arena arena, UUID uuid) {
         if (arena == null || uuid == null) return -1;
-        Integer existing = arena.spawnSlot(uuid);
-        if (existing != null && existing >= 0 && existing < arena.spawns().size()) return existing;
-        int slot = arena.firstFreeSpawnSlot();
-        if (slot >= 0) arena.assignSpawnSlot(uuid, slot);
-        return slot;
+        synchronized (stateLock) {
+            Integer existing = arena.spawnSlot(uuid);
+            if (existing != null && existing >= 0 && existing < arena.spawns().size()) return existing;
+            int slot = arena.firstFreeSpawnSlot();
+            if (slot >= 0) arena.assignSpawnSlot(uuid, slot);
+            return slot;
+        }
     }
 
-    public void rememberParticipantState(Player player) {
-        if (player == null || !player.isOnline()) return;
-        participantPreGameSnapshots.putIfAbsent(player.getUniqueId(), PlayerSnapshot.capture(player));
-    }
-
-    public void teleportParticipantToAssignedSpawn(Player player, Arena arena) {
+    private void teleportParticipantToAssignedSpawn(Player player, Arena arena) {
         if (player == null || arena == null || !player.isOnline()) return;
-        if (arena.state() != ArenaState.WAITING && arena.state() != ArenaState.COUNTDOWN) return;
+        if (!isWaitingParticipant(arena, player.getUniqueId())) return;
         int slot = assignParticipantSpawn(arena, player.getUniqueId());
-        if (slot >= 0 && slot < arena.spawns().size()) safeTeleport(player, arena.spawns().get(slot));
+        List<Location> spawns = arena.spawns();
+        if (slot >= 0 && slot < spawns.size()) safeTeleport(player, spawns.get(slot));
+    }
+
+    /** Возвращает игрока туда, откуда он пришёл на арену. Вызывается из потока игрока. */
+    private void returnToPreviousPlace(Player player) {
+        Location back = returnLocations.remove(player.getUniqueId());
+        if (back != null && back.getWorld() != null) safeTeleport(player, back);
     }
 
     public void leave(Player player) {
-        Arena activeArena = findPlayerArena(player.getUniqueId()).orElse(null);
-        if (activeArena != null && activeArena.activePlayers().contains(player.getUniqueId())) {
-            MatchSession session = sessions.get(arenaKey(activeArena));
-            PlayerSnapshot snapshot = session == null ? null : session.snapshots().get(player.getUniqueId());
+        UUID uuid = player.getUniqueId();
+        Arena activeArena = null;
+        Arena participantArena = null;
+        synchronized (stateLock) {
+            for (Arena arena : plugin.getArenaManager().all()) {
+                if (arena.activePlayers().contains(uuid)) { activeArena = arena; break; }
+            }
+            if (activeArena == null) {
+                for (Arena arena : plugin.getArenaManager().all()) {
+                    if (isWaitingParticipant(arena, uuid)) { participantArena = arena; break; }
+                }
+                if (participantArena != null) {
+                    participantArena.participants().remove(uuid);
+                    participantArena.clearSpawnSlot(uuid);
+                    MatchSession session = sessions.get(arenaKey(participantArena));
+                    if (session != null) session.snapshots().remove(uuid);
+                }
+            }
+        }
+        if (activeArena != null) {
             eliminate(player, activeArena, "Покинул игру", "", false);
             return;
         }
-        Arena participantArena = plugin.getArenaManager().all().stream().filter(a -> a.participants().contains(player.getUniqueId())).findFirst().orElse(null);
-        if (participantArena != null && (participantArena.state() == ArenaState.WAITING || participantArena.state() == ArenaState.COUNTDOWN)) {
-            participantArena.participants().remove(player.getUniqueId());
-            participantArena.clearSpawnSlot(player.getUniqueId());
-            PlayerSnapshot snapshot = participantPreGameSnapshots.remove(player.getUniqueId());
-            if (snapshot != null) {
-                snapshot.restoreState(player);
-                safeTeleport(player, snapshot.location());
-            } else if (participantArena.lobby() != null) safeTeleport(player, participantArena.lobby());
+        if (participantArena != null) {
+            // Если вещи уже сохранены перед стартом (последняя секунда отсчёта), возвращаем их из журнала.
+            if (!restoreIfPending(player, null, null)) {
+                Location back = returnLocations.remove(uuid);
+                if (back != null && back.getWorld() != null) safeTeleport(player, back);
+                else if (participantArena.lobby() != null) safeTeleport(player, participantArena.lobby());
+            }
             plugin.send(player, "left");
             plugin.getArenaManager().save();
             return;
         }
-        if (observers.containsKey(player.getUniqueId())) {
+        if (observers.containsKey(uuid)) {
             leaveObserver(player);
             return;
         }
@@ -378,56 +559,111 @@ public final class GameManager {
     }
 
     public boolean start(Arena arena) {
-        if (arena == null || arena.state() != ArenaState.WAITING || arena.collecting()) return false;
-        if (arena.participants().size() < arena.minPlayers() || arena.spawns().isEmpty() || arena.participants().size() > arena.spawns().size()) return false;
-        // onlinePlayers — это потокобезопасный кэш, который обновляется при join/quit.
-        // Не вызываем Player.isOnline() из глобального региона Folia.
-        long online = arena.participants().stream().filter(uuid -> onlinePlayers.get(uuid) != null).count();
-        if (online < arena.minPlayers()) return false;
-        arena.setState(ArenaState.COUNTDOWN);
-        return true;
+        if (arena == null) return false;
+        synchronized (stateLock) {
+            if (arena.state() != ArenaState.WAITING || arena.collecting()) return false;
+            if (arena.participants().size() < arena.minPlayers() || arena.spawns().isEmpty() || arena.participants().size() > arena.spawns().size()) return false;
+            // onlinePlayers — это потокобезопасный кэш, который обновляется при join/quit.
+            // Не вызываем Player.isOnline() из глобального региона Folia.
+            long online = arena.participants().stream().filter(uuid -> onlinePlayers.get(uuid) != null).count();
+            if (online < arena.minPlayers()) return false;
+            arena.setState(ArenaState.COUNTDOWN);
+            return true;
+        }
     }
 
-    private void startMatch(Arena arena) {
+    /** Шаг 1 старта: в потоке каждого участника сохраняем его вещи на диск и очищаем инвентарь. */
+    private void beginMatchPreparation(Arena arena) {
         String matchId = arena.id() + "-" + System.currentTimeMillis();
         MatchSession session = new MatchSession(matchId, System.currentTimeMillis());
         sessions.put(arenaKey(arena), session);
+        for (UUID uuid : new ArrayList<>(arena.participants())) {
+            Player player = onlinePlayers.get(uuid);
+            // Не читаем состояние Player из глобального региона Folia.
+            // Если игрок отсутствует в кэше, его quit уже обработан или игрок недоступен.
+            if (player == null) continue;
+            scheduler.entity(player, () -> prepareParticipant(player, arena, session), () -> session.unavailable.add(uuid));
+        }
+    }
+
+    private boolean isPreparing(Arena arena, MatchSession session, UUID uuid) {
+        return sessions.get(arenaKey(arena)) == session && !session.started()
+                && arena.state() == ArenaState.COUNTDOWN && arena.participants().contains(uuid);
+    }
+
+    /** Выполняется в потоке игрока. Порядок важен: снимок → файл на диске → очистка инвентаря. */
+    private void prepareParticipant(Player player, Arena arena, MatchSession session) {
+        UUID uuid = player.getUniqueId();
+        if (!isPreparing(arena, session, uuid) || session.snapshots().containsKey(uuid)) return;
+        if (!player.isOnline() || player.isDead()) { session.unavailable.add(uuid); return; }
+        if (restoreStore.has(uuid)) {
+            // Остались невозвращённые вещи с прошлого матча: новый снимок их бы затёр.
+            session.unavailable.add(uuid);
+            restoreIfPending(player, null, "restored-after-leave");
+            return;
+        }
+        // Предметы из сетки крафта и с курсора возвращаются в инвентарь и попадают в снимок.
+        player.closeInventory();
+        PlayerSnapshot snapshot = PlayerSnapshot.capture(player, returnLocations.get(uuid));
+        try {
+            restoreStore.save(uuid, player.getName(), arena.id(), session.id(), snapshot);
+        } catch (IOException | RuntimeException e) {
+            session.unavailable.add(uuid);
+            plugin.getLogger().log(Level.SEVERE, "Не удалось сохранить вещи игрока " + player.getName()
+                    + " перед матчем. Инвентарь не очищен, игрок в матч не попадает.", e);
+            plugin.send(player, "snapshot-failed");
+            return;
+        }
+        synchronized (stateLock) {
+            if (!isPreparing(arena, session, uuid)) {
+                // Пока файл записывался, игру остановили. Инвентарь ещё не тронут.
+                restoreStore.delete(uuid);
+                return;
+            }
+            session.snapshots().put(uuid, snapshot);
+        }
+        snapshot.prepareForMatch(player);
+    }
+
+    /** Шаг 2 старта: в матч попадают только участники, чьи вещи уже лежат на диске. */
+    private void startMatch(Arena arena, MatchSession session) {
+        List<UUID> skipped = new ArrayList<>();
         arena.activePlayers().clear();
-        arena.activePlayers().addAll(arena.participants());
+        for (UUID uuid : new ArrayList<>(arena.participants())) {
+            if (onlinePlayers.get(uuid) != null && session.snapshots().containsKey(uuid)) {
+                arena.activePlayers().add(uuid);
+                session.kills.put(uuid, 0);
+            } else {
+                skipped.add(uuid);
+            }
+        }
+        int placement = arena.activePlayers().size() + skipped.size();
+        for (UUID uuid : skipped) {
+            arena.participants().remove(uuid);
+            arena.clearSpawnSlot(uuid);
+            session.snapshots().remove(uuid);
+            addResult(arena, uuid, null, "Не подключился к игре", "", placement--);
+            Player player = onlinePlayers.get(uuid);
+            if (player == null) continue;
+            scheduler.entity(player, () -> {
+                if (!player.isOnline()) return;
+                if (!restoreIfPending(player, session.id(), null)) returnToPreviousPlace(player);
+                plugin.send(player, "start-skipped");
+            });
+        }
+
+        if (arena.activePlayers().size() < 1) { stop(arena, false); return; }
         arena.spectators().clear();
         arena.prepareShrink();
         arena.setCurrentShrinkStage(0);
         arena.startBorderChangeClock();
         plugin.getChestManager().refill(arena);
         arena.markRefillNow();
-
-        List<Location> spawns = arena.spawns();
-        for (UUID uuid : new ArrayList<>(arena.activePlayers())) {
-            Player player = onlinePlayers.get(uuid);
-            // Не читаем состояние Player из глобального региона Folia.
-            // Если игрок отсутствует в кэше, его quit уже обработан или игрок недоступен.
-            if (player == null) {
-                arena.activePlayers().remove(uuid);
-                participantPreGameSnapshots.remove(uuid);
-                arena.participants().remove(uuid);
-                addResult(arena, uuid, null, "Не подключился к игре", "", arena.activePlayers().size() + 1);
-                continue;
-            }
-            final Player currentPlayer = player;
-            scheduler.entity(currentPlayer, () -> {
-                if (!currentPlayer.isOnline() || !arena.activePlayers().contains(currentPlayer.getUniqueId())) return;
-                PlayerSnapshot preGame = participantPreGameSnapshots.remove(currentPlayer.getUniqueId());
-                PlayerSnapshot snapshot = preGame == null ? PlayerSnapshot.capture(currentPlayer) : preGame;
-                session.snapshots().put(currentPlayer.getUniqueId(), snapshot);
-                session.kills.put(currentPlayer.getUniqueId(), 0);
-                snapshot.prepareForMatch(currentPlayer);
-                // Игрок уже был телепортирован на назначенный спавн при /hg join.
-                // Повторно телепортировать его в момент START не нужно: это вызывало
-                // заметное двойное/тройное перемещение при переходе COUNTDOWN -> GAME.
-            });
-        }
-
-        if (arena.activePlayers().size() < 1) { stop(arena, false); return; }
+        arena.setContainersDirty(true);
+        session.started = true;
+        // Игрок уже был телепортирован на назначенный спавн при /hg join.
+        // Повторно телепортировать его в момент START не нужно: это вызывало
+        // заметное двойное/тройное перемещение при переходе COUNTDOWN -> GAME.
         arena.setState(ArenaState.PROTECTION);
         broadcast(arena, "game-started");
         createOrUpdateBossBar(arena);
@@ -447,162 +683,175 @@ public final class GameManager {
         eliminate(player, arena, reason, killer, killerUuid, disconnecting);
     }
 
+    /** Вызывается из потока выбывающего игрока. */
     public void eliminate(Player player, Arena arena, String reason, String killer, UUID killerUuid, boolean disconnecting) {
-        if (arena == null || !arena.activePlayers().contains(player.getUniqueId())) return;
-        MatchSession session = sessions.get(arenaKey(arena));
-        if (session == null) return;
+        if (arena == null) return;
+        UUID uuid = player.getUniqueId();
+        String matchId;
+        synchronized (stateLock) {
+            if (!arena.activePlayers().contains(uuid)) return;
+            MatchSession session = sessions.get(arenaKey(arena));
+            if (session == null) return;
+            matchId = session.id();
 
-        if (killerUuid != null && arena.activePlayers().contains(killerUuid) && !killerUuid.equals(player.getUniqueId())) {
-            session.addKill(killerUuid);
-            if (reason == null || reason.isBlank() || reason.equals("Умер")) reason = "Убит игроком";
-            if (killer == null || killer.isBlank()) {
-                Player killerPlayer = onlinePlayers.get(killerUuid);
-                killer = killerPlayer == null ? Optional.ofNullable(Bukkit.getOfflinePlayer(killerUuid).getName()).orElse("") : killerPlayer.getName();
+            if (killerUuid != null && arena.activePlayers().contains(killerUuid) && !killerUuid.equals(uuid)) {
+                session.addKill(killerUuid);
+                if (reason == null || reason.isBlank() || reason.equals("Умер")) reason = "Убит игроком";
+                if (killer == null || killer.isBlank()) {
+                    Player killerPlayer = onlinePlayers.get(killerUuid);
+                    killer = killerPlayer == null ? Optional.ofNullable(Bukkit.getOfflinePlayer(killerUuid).getName()).orElse("") : killerPlayer.getName();
+                }
             }
-        }
 
-        int placement = Math.max(2, arena.activePlayers().size());
-        arena.activePlayers().remove(player.getUniqueId());
-        arena.participants().remove(player.getUniqueId());
-        MatchHistoryManager.Result result = new MatchHistoryManager.Result(
-                player.getUniqueId(), player.getName(), placement,
-                session.kills(player.getUniqueId()),
-                reason == null ? "Выбыл" : reason,
-                killer == null ? "" : killer,
-                System.currentTimeMillis()
-        );
-        session.addResult(result);
-        broadcast(arena, "player-eliminated", "player", player.getName(), "placement", placement);
+            int placement = Math.max(2, arena.activePlayers().size());
+            arena.activePlayers().remove(uuid);
+            arena.participants().remove(uuid);
+            MatchHistoryManager.Result result = new MatchHistoryManager.Result(
+                    uuid, player.getName(), placement,
+                    session.kills(uuid),
+                    reason == null ? "Выбыл" : reason,
+                    killer == null ? "" : killer,
+                    System.currentTimeMillis()
+            );
+            session.addResult(result);
+            broadcast(arena, "player-eliminated", "player", player.getName(), "placement", placement);
+
+            if (arena.activePlayers().size() <= 1) finish(arena);
+        }
         plugin.getArenaManager().save();
 
-        PlayerSnapshot snapshot = session.snapshots().get(player.getUniqueId());
-        if (disconnecting || !player.isOnline()) {
-            if (snapshot != null) pendingRestores.put(player.getUniqueId(), snapshot);
-        } else {
-            restoreAfterElimination(player, snapshot);
-        }
-
-        if (arena.activePlayers().size() <= 1) finish(arena);
+        // Вышедшему с сервера вещи возвращаются при следующем входе: файл остаётся на диске.
+        if (!disconnecting && player.isOnline()) restoreIfPending(player, matchId, "returned-after-elimination");
     }
 
     private void finish(Arena arena) {
-        if (arena == null || arena.state() == ArenaState.FINISH || arena.state() == ArenaState.WAITING) return;
+        if (arena == null) return;
+        synchronized (stateLock) {
+            if (arena.state() == ArenaState.FINISH || arena.state() == ArenaState.WAITING) return;
 
-        MatchSession session = sessions.get(arenaKey(arena));
-        // Сначала фиксируем FINISH, чтобы обработчики границы/перемещения
-        // больше не воспринимали победителя как обычного участника игры.
-        arena.setState(ArenaState.FINISH);
+            MatchSession session = sessions.get(arenaKey(arena));
+            // Сначала фиксируем FINISH, чтобы обработчики границы/перемещения
+            // больше не воспринимали победителя как обычного участника игры.
+            arena.setState(ArenaState.FINISH);
 
-        UUID winnerUuid = arena.activePlayers().size() == 1
-                ? arena.activePlayers().iterator().next()
-                : null;
+            UUID winnerUuid = arena.activePlayers().size() == 1
+                    ? arena.activePlayers().iterator().next()
+                    : null;
 
-        if (winnerUuid != null) {
-            Player winner = onlinePlayers.get(winnerUuid);
-            String winnerName = Optional.ofNullable(Bukkit.getOfflinePlayer(winnerUuid).getName())
-                    .orElse(winnerUuid.toString().substring(0, 8));
+            if (winnerUuid != null) {
+                String winnerName = Optional.ofNullable(Bukkit.getOfflinePlayer(winnerUuid).getName())
+                        .orElse(winnerUuid.toString().substring(0, 8));
 
-            if (session != null && !session.hasResult(winnerUuid)) {
-                session.addResult(new MatchHistoryManager.Result(
-                        winnerUuid, winnerName, 1, session.kills(winnerUuid),
-                        "Победитель", "", System.currentTimeMillis()));
+                if (session != null && !session.hasResult(winnerUuid)) {
+                    session.addResult(new MatchHistoryManager.Result(
+                            winnerUuid, winnerName, 1, session.kills(winnerUuid),
+                            "Победитель", "", System.currentTimeMillis()));
+                }
+                broadcast(arena, "winner", "player", winnerName);
+            } else {
+                broadcast(arena, "no-winner");
             }
-            broadcast(arena, "winner", "player", winnerName);
-        } else {
-            broadcast(arena, "no-winner");
+
+            // Историю записываем до очистки сессии. Так победитель гарантированно
+            // попадает в matches.yml как 1 место.
+            if (session != null) {
+                long ended = System.currentTimeMillis();
+                plugin.getMatchHistoryManager().record(
+                        arena.id(), session.id(), session.startedAt(), ended, session.results());
+            }
+
+            // Сразу завершаем runtime матча. Внутри stop() победитель будет
+            // восстановлен, а состояние арены вернётся в WAITING без пятисекундного
+            // окна, когда бывший победитель ещё считался активным игроком.
+            stop(arena, false);
         }
-
-        // Историю записываем до очистки сессии. Так победитель гарантированно
-        // попадает в matches.yml как 1 место.
-        if (session != null) {
-            long ended = System.currentTimeMillis();
-            plugin.getMatchHistoryManager().record(
-                    arena.id(), session.id(), session.startedAt(), ended, session.results());
-        }
-
-        plugin.getChestManager().clearContainers(arena);
-
-        // Сразу завершаем runtime матча. Внутри stop() победитель будет
-        // восстановлен, а состояние арены вернётся в WAITING без пятисекундного
-        // окна, когда бывший победитель ещё считался активным игроком.
-        stop(arena, false);
     }
 
     public void stop(Arena arena, boolean announce) {
         if (arena == null) return;
-        MatchSession session = sessions.get(arenaKey(arena));
-        if (session != null && arena.state() != ArenaState.WAITING) {
-            if (!session.results().isEmpty() || !arena.activePlayers().isEmpty()) {
-                for (UUID uuid : new HashSet<>(arena.activePlayers())) {
-                    Player player = onlinePlayers.get(uuid);
-                    if (player != null) {
-                        PlayerSnapshot snapshot = session.snapshots().get(uuid);
-                        scheduler.entity(player, () -> {
-                            if (player.isOnline()) restoreAfterMatch(player, snapshot);
-                            else if (snapshot != null) pendingRestores.put(uuid, snapshot);
-                        });
-                    } else if (session.snapshots().containsKey(uuid)) pendingRestores.put(uuid, session.snapshots().get(uuid));
+        String matchId = null;
+        Set<UUID> matchPlayers = new LinkedHashSet<>();
+        Set<UUID> inArena = new LinkedHashSet<>();
+        synchronized (stateLock) {
+            String key = arenaKey(arena);
+            MatchSession session = sessions.remove(key);
+            if (session != null) {
+                matchId = session.id();
+                matchPlayers.addAll(session.snapshots().keySet());
+                if (session.started() && arena.state() != ArenaState.FINISH && !session.results().isEmpty()) {
+                    plugin.getMatchHistoryManager().record(arena.id(), session.id(), session.startedAt(), System.currentTimeMillis(), session.results());
                 }
             }
-            if (arena.state() != ArenaState.FINISH && !session.results().isEmpty()) {
-                plugin.getMatchHistoryManager().record(arena.id(), session.id(), session.startedAt(), System.currentTimeMillis(), session.results());
+            inArena.addAll(arena.participants());
+            inArena.addAll(arena.activePlayers());
+
+            for (UUID uuid : observers.keySet().stream().filter(id -> observers.get(id) == arena).toList()) {
+                observers.remove(uuid);
+                ObserverState state = observerStates.remove(uuid);
+                Player player = onlinePlayers.get(uuid);
+                // Режим и место наблюдателя меняются только в его собственном потоке.
+                scheduler.entity(player, () -> {
+                    if (player.isOnline()) restoreObserver(player, state, "observer-left");
+                    else if (state != null) pendingObserverRestores.put(uuid, state);
+                }, () -> { if (state != null) pendingObserverRestores.put(uuid, state); });
             }
+
+            BossBar bar = bossBars.remove(key);
+            bossBarViewers.remove(key);
+            if (bar != null) scheduler.global(bar::removeAll);
+
+            clearArenaRuntime(arena);
+        }
+
+        final String stoppedMatch = matchId;
+        Set<UUID> release = new LinkedHashSet<>(matchPlayers);
+        release.addAll(inArena);
+        for (UUID uuid : release) {
+            Player player = onlinePlayers.get(uuid);
+            // Если игрок не в сети, его вещи вернутся из папки restore при следующем входе.
+            if (player == null) continue;
+            boolean wasInArena = inArena.contains(uuid);
+            scheduler.entity(player, () -> {
+                if (!player.isOnline()) return;
+                boolean restored = stoppedMatch != null && restoreIfPending(player, stoppedMatch, "inventory-restored");
+                // Участник сбора, чьи вещи не сохранялись: просто возвращаем на прежнее место.
+                if (!restored && wasInArena) returnToPreviousPlace(player);
+                if (announce && wasInArena) plugin.send(player, "game-stopped");
+            });
         }
 
         // Also clear containers on manual/forced stop so no generated loot remains.
         plugin.getChestManager().clearContainers(arena);
-
-        for (UUID uuid : new HashSet<>(arena.spectators())) {
-            arena.spectators().remove(uuid);
-        }
-        for (UUID uuid : observers.keySet().stream().filter(id -> observers.get(id) == arena).toList()) {
-            Player player = onlinePlayers.get(uuid);
-            if (player != null && player.isOnline()) leaveObserver(player);
-            else {
-                ObserverState state = observerStates.remove(uuid);
-                if (state != null) pendingObserverRestores.put(uuid, state);
-                observers.remove(uuid);
-            }
-        }
-
-        BossBar bar = bossBars.remove(arenaKey(arena));
-        Set<UUID> viewers = bossBarViewers.remove(arenaKey(arena));
-        if (bar != null && viewers != null) {
-            for (UUID uuid : viewers) {
-                Player viewer = onlinePlayers.get(uuid);
-                if (viewer != null) scheduler.entity(viewer, () -> { if (viewer.isOnline()) bar.removePlayer(viewer); });
-            }
-        }
-        // Любые незавершённые pre-game snapshots относятся только к старому матчу.
-        for (UUID uuid : new HashSet<>(arena.participants())) {
-            participantPreGameSnapshots.remove(uuid);
-        }
-        arena.activePlayers().clear();
-        arena.spectators().clear();
-        arena.participants().clear();
-        // После окончания матча все старые привязки игроков к точкам появления
-        // должны быть удалены. Иначе firstFreeSpawnSlot() считает старые точки занятыми
-        // и следующую игру на этой же арене начать невозможно.
-        arena.spawnSlots().clear();
-        arena.setState(ArenaState.WAITING);
-        arena.setCollecting(false);
-        sessions.remove(arenaKey(arena));
-        if (announce) broadcast(arena, "game-stopped");
+        arena.setContainersDirty(false);
         plugin.getArenaManager().save();
     }
 
     public boolean observe(Player player, Arena arena, boolean spectatorMode) {
         if (arena == null || arena.state() == ArenaState.WAITING) { plugin.send(player, "observe-not-running"); return false; }
-        if (arena.activePlayers().contains(player.getUniqueId())) {
-            plugin.send(player, "already-in-game");
-            return false;
+        UUID uuid = player.getUniqueId();
+        for (Arena other : plugin.getArenaManager().all()) {
+            if (other.activePlayers().contains(uuid) || other.participants().contains(uuid)) {
+                plugin.send(player, other == arena ? "already-in-game" : "already-in-other-arena");
+                return false;
+            }
         }
-        leaveOtherArenaObservation(player.getUniqueId());
-        ObserverState state = new ObserverState(player.getLocation().clone(), player.getGameMode(), player.getAllowFlight(), player.isFlying());
-        observers.put(player.getUniqueId(), arena);
-        observerStates.put(player.getUniqueId(), state);
+        // При переходе с другой арены сохраняем исходные режим и место, а не промежуточные.
+        ObserverState previous = observerStates.get(uuid);
+        ObserverState state = previous != null ? previous
+                : new ObserverState(player.getLocation().clone(), player.getGameMode(), player.getAllowFlight(), player.isFlying());
+        synchronized (stateLock) {
+            if (arena.state() == ArenaState.WAITING) { plugin.send(player, "observe-not-running"); return false; }
+            Arena previousArena = observers.put(uuid, arena);
+            observerStates.put(uuid, state);
+            if (previousArena != null && previousArena != arena) removeFromBossBars(player);
+        }
 
         if (spectatorMode) player.setGameMode(org.bukkit.GameMode.SPECTATOR);
+        else if (previous != null) {
+            player.setGameMode(previous.previousGameMode());
+            player.setAllowFlight(previous.previousAllowFlight());
+            player.setFlying(previous.previousAllowFlight() && previous.previousFlying());
+        }
 
         Location target = arena.shrinkCenterLocation();
         if (target == null) {
@@ -615,19 +864,23 @@ public final class GameManager {
         return true;
     }
 
+    /** Вызывается из потока наблюдателя. */
     public void leaveObserver(Player player) {
         Arena arena = observers.remove(player.getUniqueId());
         ObserverState state = observerStates.remove(player.getUniqueId());
         if (arena == null && state == null) return;
+        restoreObserver(player, state, "observer-left");
+        removeFromBossBars(player);
+    }
+
+    private void restoreObserver(Player player, ObserverState state, String messageKey) {
         if (player.isOnline() && state != null) {
             player.setGameMode(state.previousGameMode());
             player.setAllowFlight(state.previousAllowFlight());
             player.setFlying(state.previousAllowFlight() && state.previousFlying());
             safeTeleport(player, state.returnLocation());
         }
-        BossBar bar = arena == null ? null : bossBars.get(arenaKey(arena));
-        if (bar != null && bar.getPlayers().contains(player)) bar.removePlayer(player);
-        plugin.send(player, "observer-left");
+        plugin.send(player, messageKey);
     }
 
     public boolean isObserver(UUID uuid, Arena arena) { return observers.get(uuid) == arena; }
@@ -649,49 +902,147 @@ public final class GameManager {
         return findPlayerArena(uuid).map(a -> a.activePlayers().contains(uuid)).orElse(false);
     }
 
+    /** Место, куда участник вернётся после матча, или null. Используется как точка возрождения. */
+    public Location returnLocation(Arena arena, UUID uuid) {
+        MatchSession session = arena == null ? null : sessions.get(arenaKey(arena));
+        PlayerSnapshot snapshot = session == null ? null : session.snapshots().get(uuid);
+        return snapshot == null ? null : snapshot.location();
+    }
+
+    /** Вызывается из потока игрока при входе на сервер (и при включении плагина для игроков онлайн). */
     public void handlePlayerJoin(Player player) {
         trackOnlinePlayer(player);
-        PlayerSnapshot snapshot = pendingRestores.remove(player.getUniqueId());
-        if (snapshot != null) {
+        UUID uuid = player.getUniqueId();
+        if (restoreStore.has(uuid)) {
             scheduler.entity(player, () -> {
-                restorePendingSnapshot(player, snapshot);
-                plugin.send(player, "restored-after-leave");
+                if (player.isOnline()) restoreIfPending(player, null, "restored-after-leave");
             });
         }
-        ObserverState observerState = pendingObserverRestores.remove(player.getUniqueId());
+        ObserverState observerState = pendingObserverRestores.remove(uuid);
         if (observerState != null) {
-            scheduler.entity(player, () -> {
-                player.setGameMode(observerState.previousGameMode());
-                player.setAllowFlight(observerState.previousAllowFlight());
-                player.setFlying(observerState.previousAllowFlight() && observerState.previousFlying());
-                safeTeleport(player, observerState.returnLocation());
-                plugin.send(player, "observer-restored-after-leave");
-            });
+            scheduler.entity(player, () -> restoreObserver(player, observerState, "observer-restored-after-leave"),
+                    () -> pendingObserverRestores.put(uuid, observerState));
         }
+        boolean participant = false;
         for (Arena arena : plugin.getArenaManager().all()) {
-            if ((arena.state() == ArenaState.WAITING || arena.state() == ArenaState.COUNTDOWN) && arena.participants().contains(player.getUniqueId())) {
-                assignParticipantSpawn(arena, player.getUniqueId());
+            if (isWaitingParticipant(arena, uuid)) {
+                participant = true;
+                assignParticipantSpawn(arena, uuid);
                 scheduler.entity(player, () -> {
-                    if (!player.isOnline()) return;
-                    rememberParticipantState(player);
+                    if (!player.isOnline() || !isWaitingParticipant(arena, uuid)) return;
+                    returnLocations.putIfAbsent(uuid, player.getLocation().clone());
                     teleportParticipantToAssignedSpawn(player, arena);
                 });
                 break;
             }
         }
-        scheduler.entityLater(player, 1L, () -> enforceArenaEntry(player));
+        if (!participant && !restoreStore.has(uuid) && returnLocations.containsKey(uuid)) {
+            // Пока игрок был не в сети, его убрали из участников: возвращаем с арены на прежнее место.
+            scheduler.entity(player, () -> { if (player.isOnline()) returnToPreviousPlace(player); });
+        }
+        scheduler.entityLater(player, 1L, () -> {
+            if (!player.isOnline()) return;
+            refreshStaff(player);
+            enforceArenaEntry(player);
+        });
     }
 
+    /** Вызывается из потока игрока при выходе с сервера. */
     public void handlePlayerQuit(Player player) {
-        Arena arena = findPlayerArena(player.getUniqueId()).orElse(null);
-        if (arena != null && arena.activePlayers().contains(player.getUniqueId())) {
-            eliminate(player, arena, "Вышел из игры", "", true);
-        } else if (observers.containsKey(player.getUniqueId())) {
-            ObserverState state = observerStates.remove(player.getUniqueId());
-            if (state != null) pendingObserverRestores.put(player.getUniqueId(), state);
-            observers.remove(player.getUniqueId());
+        UUID uuid = player.getUniqueId();
+        Arena activeArena = null;
+        synchronized (stateLock) {
+            for (Arena arena : plugin.getArenaManager().all()) {
+                if (arena.activePlayers().contains(uuid)) { activeArena = arena; break; }
+                MatchSession session = sessions.get(arenaKey(arena));
+                if (session != null && !session.started() && session.snapshots().remove(uuid) != null) {
+                    // Вещи уже сохранены и инвентарь очищен, но матч ещё не начался:
+                    // игрок выбывает из набора, вещи вернутся из файла при следующем входе.
+                    arena.participants().remove(uuid);
+                    arena.clearSpawnSlot(uuid);
+                }
+            }
         }
-        onlinePlayers.remove(player.getUniqueId());
+        if (activeArena != null) {
+            eliminate(player, activeArena, "Вышел из игры", "", true);
+        } else if (observers.containsKey(uuid)) {
+            ObserverState state = observerStates.remove(uuid);
+            if (state != null) pendingObserverRestores.put(uuid, state);
+            observers.remove(uuid);
+        }
+        onlinePlayers.remove(uuid);
+        staffOnline.remove(uuid);
+        removeFromBossBars(player);
+    }
+
+    /** Игрок возродился: если его вещи ещё лежат в файле, а матч для него закончен — возвращаем. */
+    public void handlePostRespawn(Player player) {
+        if (restoreStore.has(player.getUniqueId())) restoreIfPending(player, null, "restored-after-leave");
+    }
+
+    /**
+     * Возвращает игроку вещи и состояние из файла восстановления. Только из потока игрока.
+     *
+     * @param matchId если задан — вернуть только вещи, сохранённые перед этим матчем;
+     *                null — любые, кроме вещей матча, в котором игрок участвует прямо сейчас
+     * @return true, если возврат выполнен или отложен (игрок мёртв) либо не удался; вызывающий код
+     *         в этих случаях не должен сам телепортировать игрока
+     */
+    private boolean restoreIfPending(Player player, String matchId, String messageKey) {
+        return restoreIfPending(player, matchId, messageKey, 0);
+    }
+
+    private boolean restoreIfPending(Player player, String matchId, String messageKey, int attempt) {
+        UUID uuid = player.getUniqueId();
+        String pendingMatch = restoreStore.pendingMatch(uuid);
+        if (pendingMatch == null) return false;
+        if (matchId != null ? !matchId.equals(pendingMatch) : isInLiveMatch(uuid, pendingMatch)) return false;
+        if (player.isDead()) {
+            // Мёртвому игроку вещи не вернуть. Ждём возрождения; файл остаётся на диске.
+            if (attempt < 60) {
+                scheduler.entityLater(player, 10L, () -> {
+                    if (player.isOnline()) restoreIfPending(player, matchId, messageKey, attempt + 1);
+                });
+            }
+            return true;
+        }
+        PlayerSnapshot snapshot;
+        try {
+            snapshot = restoreStore.load(uuid);
+            if (snapshot == null) return false;
+            // Лут из сетки крафта и с курсора уходит в игровой инвентарь, который сейчас будет заменён.
+            player.closeInventory();
+            snapshot.restoreState(player);
+        } catch (Exception e) {
+            plugin.getLogger().log(Level.SEVERE, "Не удалось вернуть вещи игроку " + player.getName() + " (" + uuid
+                    + "). Файл восстановления оставлен на диске.", e);
+            plugin.send(player, "restore-failed");
+            return true;
+        }
+        try {
+            // Сохраняем данные игрока до удаления файла: иначе сбой сервера между возвратом вещей
+            // и очередным автосохранением оставил бы игрока с игровым инвентарём и без файла.
+            player.saveData();
+        } catch (RuntimeException e) {
+            plugin.getLogger().log(Level.WARNING, "Не удалось сразу сохранить данные игрока " + player.getName(), e);
+        }
+        restoreStore.delete(uuid);
+        returnLocations.remove(uuid);
+        Location back = snapshot.location();
+        if (back == null && !Bukkit.getWorlds().isEmpty()) back = Bukkit.getWorlds().get(0).getSpawnLocation();
+        safeTeleport(player, back);
+        if (messageKey != null) plugin.send(player, messageKey);
+        return true;
+    }
+
+    /** true, если вещи игрока сохранены перед матчем, в котором он участвует прямо сейчас. */
+    private boolean isInLiveMatch(UUID uuid, String matchId) {
+        for (Arena arena : plugin.getArenaManager().all()) {
+            MatchSession session = sessions.get(arenaKey(arena));
+            if (session != null && session.id().equals(matchId)
+                    && (arena.activePlayers().contains(uuid) || arena.participants().contains(uuid))) return true;
+        }
+        return false;
     }
 
     public MatchSession liveSession(Arena arena) { return sessions.get(arenaKey(arena)); }
@@ -735,7 +1086,8 @@ public final class GameManager {
         for (Arena arena : plugin.getArenaManager().all()) {
             if (arena.state() == ArenaState.WAITING || arena.state() == ArenaState.FINISH || arena.state() == ArenaState.STOPPED) continue;
             if (!arena.insideOuter(player.getLocation())) continue;
-            if (arena.activePlayers().contains(player.getUniqueId()) || isObserver(player.getUniqueId(), arena)) return;
+            UUID uuid = player.getUniqueId();
+            if (arena.activePlayers().contains(uuid) || arena.participants().contains(uuid) || isObserver(uuid, arena)) return;
             sendOutOfArena(player, arena);
             return;
         }
@@ -757,12 +1109,22 @@ public final class GameManager {
     }
 
     private void enforceAllNonParticipants() {
-        for (Arena arena : plugin.getArenaManager().all()) {
-            if (arena.state() == ArenaState.WAITING) continue;
-            for (Player player : new ArrayList<>(onlinePlayers.values())) {
-                scheduler.entity(player, () -> enforceNonParticipant(player, arena));
-            }
+        List<Arena> running = plugin.getArenaManager().all().stream()
+                .filter(arena -> arena.state() != ArenaState.WAITING).toList();
+        if (running.isEmpty()) return;
+        for (Player player : new ArrayList<>(onlinePlayers.values())) {
+            scheduler.entity(player, () -> {
+                if (!player.isOnline()) return;
+                refreshStaff(player);
+                for (Arena arena : running) enforceNonParticipant(player, arena);
+            });
         }
+    }
+
+    /** Права проверяются в потоке игрока; результат используется при отрисовке границы. */
+    private void refreshStaff(Player player) {
+        if (plugin.getAccessManager().hasAccess(player)) staffOnline.add(player.getUniqueId());
+        else staffOnline.remove(player.getUniqueId());
     }
 
     public void rejectArenaEntry(Player player, Arena arena) {
@@ -786,32 +1148,6 @@ public final class GameManager {
                 }
             }
         });
-    }
-
-    private void restoreAfterElimination(Player player, PlayerSnapshot snapshot) {
-        if (snapshot == null) return;
-        snapshot.restoreState(player);
-        safeTeleport(player, snapshot.location());
-        plugin.send(player, "returned-after-elimination");
-    }
-
-
-    private void restoreAfterMatch(Player player, PlayerSnapshot snapshot) {
-        if (snapshot == null) return;
-        snapshot.restoreState(player);
-        safeTeleport(player, snapshot.location());
-        plugin.send(player, "inventory-restored");
-    }
-
-
-    private void restorePending(Player player) {
-        PlayerSnapshot snapshot = pendingRestores.remove(player.getUniqueId());
-        if (snapshot != null) restorePendingSnapshot(player, snapshot);
-    }
-
-    private void restorePendingSnapshot(Player player, PlayerSnapshot snapshot) {
-        snapshot.restoreState(player);
-        safeTeleport(player, snapshot.location());
     }
 
     private void addResult(Arena arena, UUID uuid, Player player, String reason, String killer, int placement) {
@@ -841,30 +1177,32 @@ public final class GameManager {
         };
     }
 
-    private void leaveOtherArenaObservation(UUID uuid) {
-        Arena previous = observers.remove(uuid);
-        ObserverState state = observerStates.remove(uuid);
-        if (state != null) {
-            Player player = onlinePlayers.get(uuid);
-            if (player != null && player.isOnline()) {
-                player.setGameMode(state.previousGameMode());
-                player.setAllowFlight(state.previousAllowFlight());
-                player.setFlying(state.previousAllowFlight() && state.previousFlying());
-                safeTeleport(player, state.returnLocation());
-            }
-            if (previous != null) {
-                BossBar bar = bossBars.get(arenaKey(previous));
-                if (bar != null && player != null && bar.getPlayers().contains(player)) bar.removePlayer(player);
-            }
-        }
-    }
-
+    // BossBar меняется только в глобальном потоке: добавление зрителей из потоков игроков
+    // одновременно с обновлением заголовка портило бы общий список зрителей.
     private void createOrUpdateBossBar(Arena arena) {
         scheduler.global(() -> updateBossBarGlobal(arena));
     }
 
+    private void removeFromBossBars(Player player) {
+        UUID uuid = player.getUniqueId();
+        scheduler.global(() -> {
+            for (Map.Entry<String, BossBar> entry : bossBars.entrySet()) {
+                Set<UUID> viewers = bossBarViewers.get(entry.getKey());
+                if (viewers != null) viewers.remove(uuid);
+                entry.getValue().removePlayer(player);
+            }
+        });
+    }
+
     private void updateBossBarGlobal(Arena arena) {
         String key = arenaKey(arena);
+        if (arena.state() == ArenaState.WAITING || plugin.getArenaManager().get(arena.id()) != arena) {
+            // Игра уже остановлена: запоздавшее обновление не должно создавать полосу заново.
+            BossBar stale = bossBars.remove(key);
+            bossBarViewers.remove(key);
+            if (stale != null) stale.removeAll();
+            return;
+        }
         BossBar bar = bossBars.computeIfAbsent(key, ignored -> Bukkit.createBossBar(HungerGamesPlugin.color("&5HungerGames"), BarColor.PURPLE, BarStyle.SEGMENTED_10));
         long elapsed = arena.phaseElapsedSeconds();
         String title; double progress;
@@ -904,20 +1242,20 @@ public final class GameManager {
         }
         bar.setTitle(HungerGamesPlugin.color(title));
         bar.setProgress(Math.max(0.0, Math.min(1.0, progress)));
-        Set<UUID> desired = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        desired.addAll(arena.activePlayers());
+        Set<UUID> desired = new HashSet<>(arena.activePlayers());
         desired.addAll(arena.spectators());
         desired.addAll(arena.participants());
+        observers.forEach((uuid, observed) -> { if (observed == arena) desired.add(uuid); });
         Set<UUID> current = bossBarViewers.computeIfAbsent(key, ignored -> java.util.concurrent.ConcurrentHashMap.newKeySet());
         for (UUID uuid : desired) {
             Player player = onlinePlayers.get(uuid);
-            if (player != null && player.isOnline() && current.add(uuid)) scheduler.entity(player, () -> bar.addPlayer(player));
+            if (player != null && current.add(uuid)) bar.addPlayer(player);
         }
         for (UUID uuid : new HashSet<>(current)) {
             if (!desired.contains(uuid)) {
                 current.remove(uuid);
                 Player player = onlinePlayers.get(uuid);
-                if (player != null && player.isOnline()) scheduler.entity(player, () -> bar.removePlayer(player));
+                if (player != null) bar.removePlayer(player);
             }
         }
     }
@@ -933,12 +1271,12 @@ public final class GameManager {
         return mode == BorderMode.SOFT_TELEPORT ? BarColor.GREEN : BarColor.RED;
     }
 
-    private void enforceBossBarsOnlyForActivePlayers() { }
-
     private void broadcast(Arena arena, String key, Object... replacements) {
         String message = plugin.msg(key, replacements);
         Set<UUID> receivers = new HashSet<>(arena.activePlayers());
         receivers.addAll(arena.spectators());
+        // Во время обратного отсчёта игроки ещё числятся только участниками.
+        receivers.addAll(arena.participants());
         for (UUID uuid : receivers) {
             Player player = onlinePlayers.get(uuid);
             if (player != null) scheduler.entity(player, () -> { if (player.isOnline()) player.sendMessage(message); });
@@ -946,79 +1284,103 @@ public final class GameManager {
     }
 
     private void safeTeleport(Player player, Location location) {
-        if (player == null || !player.isOnline() || location == null) return;
-        pluginTeleports.add(player.getUniqueId());
+        if (player == null || location == null || location.getWorld() == null) return;
+        UUID uuid = player.getUniqueId();
+        pluginTeleports.add(uuid);
         scheduler.entity(player, () -> {
-            if (!player.isOnline()) return;
+            if (!player.isOnline()) { pluginTeleports.remove(uuid); return; }
             player.teleportAsync(location);
-            scheduler.entityLater(player, 2L, () -> pluginTeleports.remove(player.getUniqueId()));
-        });
+            scheduler.entityLater(player, 2L, () -> pluginTeleports.remove(uuid));
+        }, () -> pluginTeleports.remove(uuid));
     }
 
     private void renderBorderParticles(Arena arena) {
         if (!plugin.getConfig().getBoolean("border-particles.enabled", true)) return;
-        if (arena == null || arena.pos1() == null || arena.pos2() == null) return;
+        if (arena == null) return;
+        Location pos1 = arena.pos1(), pos2 = arena.pos2();
+        UUID worldUid = arena.worldUid();
+        if (pos1 == null || pos2 == null || worldUid == null) return;
         if (arena.state() != ArenaState.COUNTDOWN && arena.state() != ArenaState.PROTECTION && arena.state() != ArenaState.GAME) return;
 
-        World world = Bukkit.getWorld(arena.worldUid());
+        World world = Bukkit.getWorld(worldUid);
         if (world == null) return;
-        double minX = Math.min(arena.pos1().getX(), arena.pos2().getX());
-        double maxX = Math.max(arena.pos1().getX(), arena.pos2().getX());
-        double minZ = Math.min(arena.pos1().getZ(), arena.pos2().getZ());
-        double maxZ = Math.max(arena.pos1().getZ(), arena.pos2().getZ());
+        double minX = Math.min(pos1.getX(), pos2.getX());
+        double maxX = Math.max(pos1.getX(), pos2.getX());
+        double minZ = Math.min(pos1.getZ(), pos2.getZ());
+        double maxZ = Math.max(pos1.getZ(), pos2.getZ());
         if (minX >= maxX || minZ >= maxZ) return;
-        double minY = Math.min(arena.pos1().getY(), arena.pos2().getY());
-        double maxY = Math.max(arena.pos1().getY(), arena.pos2().getY());
+        double minY = Math.min(pos1.getY(), pos2.getY());
+        double maxY = Math.max(pos1.getY(), pos2.getY());
         double step = Math.max(1.5, plugin.getConfig().getDouble("border-particles.step", 2.0));
         float size = (float) Math.max(0.35, Math.min(1.0, plugin.getConfig().getDouble("border-particles.size", 0.8)));
+        // Граница рисуется только рядом с игроком: вся стена большой арены — это тысячи пакетов в секунду.
+        double radius = Math.max(4.0, plugin.getConfig().getDouble("border-particles.view-radius", 24.0));
+        double height = Math.max(0.0, plugin.getConfig().getDouble("border-particles.height", 5.0));
+        double rowStep = Math.max(0.5, plugin.getConfig().getDouble("border-particles.row-step", 1.25));
         Particle.DustOptions dust = new Particle.DustOptions(currentBorderColor(arena), size);
+        boolean shrink = arena.shrinkActive();
+        double shrinkMinX = arena.shrinkCenterX() - arena.currentHalfX();
+        double shrinkMaxX = arena.shrinkCenterX() + arena.currentHalfX();
+        double shrinkMinZ = arena.shrinkCenterZ() - arena.currentHalfZ();
+        double shrinkMaxZ = arena.shrinkCenterZ() + arena.currentHalfZ();
 
-        for (Player viewer : new ArrayList<>(onlinePlayers.values())) {
+        Set<UUID> viewers = new HashSet<>(arena.activePlayers());
+        viewers.addAll(arena.participants());
+        viewers.addAll(arena.spectators());
+        observers.forEach((uuid, observed) -> { if (observed == arena) viewers.add(uuid); });
+        viewers.addAll(staffOnline);
+        for (UUID uuid : viewers) {
+            Player viewer = onlinePlayers.get(uuid);
             if (viewer == null) continue;
             scheduler.entity(viewer, () -> {
                 if (!viewer.isOnline() || viewer.getWorld() != world) return;
-                UUID uuid = viewer.getUniqueId();
-                boolean relevant = arena.activePlayers().contains(uuid) || arena.participants().contains(uuid)
-                        || arena.spectators().contains(uuid) || isObserver(uuid, arena) || plugin.getAccessManager().hasAccess(viewer);
-                if (!relevant) return;
-                double baseY = Math.max(minY + 1.0, Math.min(maxY - 1.0, viewer.getLocation().getY()));
-                double topY = Math.min(maxY, baseY + 5.0);
-                spawnBorderWall(viewer, minX, maxX, minZ, maxZ, baseY, topY, step, dust);
-                if (arena.shrinkActive()) {
-                    double halfX = arena.currentHalfX();
-                    double halfZ = arena.currentHalfZ();
-                    spawnBorderWall(viewer, arena.shrinkCenterX() - halfX, arena.shrinkCenterX() + halfX,
-                            arena.shrinkCenterZ() - halfZ, arena.shrinkCenterZ() + halfZ, baseY, topY, step, dust);
+                Location at = viewer.getLocation();
+                double baseY = Math.max(minY + 1.0, Math.min(maxY - 1.0, at.getY()));
+                double topY = Math.min(maxY, baseY + height);
+                spawnBorderWall(viewer, at, radius, minX, maxX, minZ, maxZ, baseY, topY, step, rowStep, dust);
+                if (shrink) {
+                    spawnBorderWall(viewer, at, radius, shrinkMinX, shrinkMaxX, shrinkMinZ, shrinkMaxZ, baseY, topY, step, rowStep, dust);
                 }
             });
         }
     }
 
-    private void spawnBorderWall(Player viewer, double minX, double maxX, double minZ, double maxZ,
-                                  double baseY, double topY, double step, Particle.DustOptions dust) {
-        spawnBorderLine(viewer, minX, maxX, minZ, minZ, baseY, step, dust);
-        spawnBorderLine(viewer, minX, maxX, maxZ, maxZ, baseY, step, dust);
-        spawnBorderLine(viewer, minX, minX, minZ, maxZ, baseY, step, dust);
-        spawnBorderLine(viewer, maxX, maxX, minZ, maxZ, baseY, step, dust);
-        double yStep = 0.75;
-        for (double y = baseY + yStep; y <= topY + 0.01; y += yStep) {
-            spawnBorderLine(viewer, minX, maxX, minZ, minZ, y, step, dust);
-            spawnBorderLine(viewer, minX, maxX, maxZ, maxZ, y, step, dust);
-            spawnBorderLine(viewer, minX, minX, minZ, maxZ, y, step, dust);
-            spawnBorderLine(viewer, maxX, maxX, minZ, maxZ, y, step, dust);
+    private void spawnBorderWall(Player viewer, Location at, double radius, double minX, double maxX, double minZ, double maxZ,
+                                  double baseY, double topY, double step, double rowStep, Particle.DustOptions dust) {
+        for (double y = baseY; y <= topY + 0.01; y += rowStep) {
+            spawnBorderLine(viewer, true, minX, maxX, minZ, at.getX(), at.getZ(), radius, y, step, dust);
+            spawnBorderLine(viewer, true, minX, maxX, maxZ, at.getX(), at.getZ(), radius, y, step, dust);
+            spawnBorderLine(viewer, false, minZ, maxZ, minX, at.getZ(), at.getX(), radius, y, step, dust);
+            spawnBorderLine(viewer, false, minZ, maxZ, maxX, at.getZ(), at.getX(), radius, y, step, dust);
         }
     }
 
-    private void spawnBorderLine(Player viewer, double x1, double x2, double z1, double z2,
+    /**
+     * Отрезок стены от from до to вдоль оси X (alongX) или Z; fixed — координата стены по другой оси.
+     * Рисуется только часть в пределах radius от игрока.
+     */
+    private void spawnBorderLine(Player viewer, boolean alongX, double from, double to, double fixed,
+                                 double viewerAlong, double viewerAcross, double radius,
                                  double y, double step, Particle.DustOptions dust) {
-        double length = Math.max(Math.abs(x2 - x1), Math.abs(z2 - z1));
-        int points = Math.max(2, Math.min(80, (int) Math.ceil(length / step)));
-        for (int i = 0; i <= points; i++) {
-            double t = i / (double) points;
-            double x = x1 + (x2 - x1) * t;
-            double z = z1 + (z2 - z1) * t;
-            viewer.spawnParticle(Particle.DUST, x, y, z, 1, 0, 0, 0, 0, dust, true);
+        if (Math.abs(viewerAcross - fixed) > radius) return;
+        double start = Math.max(from, viewerAlong - radius);
+        double end = Math.min(to, viewerAlong + radius);
+        if (start > end) return;
+        // Точки привязаны к сетке от начала стены, чтобы частицы не смещались при движении игрока.
+        double first = from + Math.ceil((start - from) / step - 1.0e-9) * step;
+        double last = first;
+        for (double along = first; along <= end + 1.0e-9; along += step) {
+            spawnBorderParticle(viewer, alongX, along, fixed, y, dust);
+            last = along;
         }
+        // Угол стены не всегда попадает в сетку.
+        if (end >= to - 1.0e-9 && to - last > step * 0.25) spawnBorderParticle(viewer, alongX, to, fixed, y, dust);
+    }
+
+    private void spawnBorderParticle(Player viewer, boolean alongX, double along, double fixed, double y, Particle.DustOptions dust) {
+        double x = alongX ? along : fixed;
+        double z = alongX ? fixed : along;
+        viewer.spawnParticle(Particle.DUST, x, y, z, 1, 0, 0, 0, 0, dust, true);
     }
 
     private Color currentBorderColor(Arena arena) {

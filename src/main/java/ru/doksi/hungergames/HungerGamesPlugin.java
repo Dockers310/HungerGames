@@ -65,6 +65,8 @@ public final class HungerGamesPlugin extends JavaPlugin {
         arenaManager.load();
         chestManager.load();
         matchHistoryManager.load();
+        gameManager.load();
+        clearDirtyContainers();
 
         HungerGamesListener listener = new HungerGamesListener(this);
         Bukkit.getPluginManager().registerEvents(listener, this);
@@ -77,8 +79,24 @@ public final class HungerGamesPlugin extends JavaPlugin {
         }
 
         gameManager.startTicker();
-        for (Player player : Bukkit.getOnlinePlayers()) gameManager.trackOnlinePlayer(player);
-        getLogger().info("HungerGames 1.6.4 enabled. Paper/Folia compatible mode is active.");
+        // Игроки уже в сети только после перезагрузки плагина: возвращаем вещи тем, кому не успели.
+        for (Player player : Bukkit.getOnlinePlayers()) gameManager.handlePlayerJoin(player);
+        getLogger().info("HungerGames " + getPluginMeta().getVersion() + " enabled. Paper/Folia compatible mode is active.");
+    }
+
+    /**
+     * Если сервер остановили во время матча, в контейнерах арены остался лут.
+     * Очищаем его при запуске (или когда мир арены загрузится).
+     */
+    public void clearDirtyContainers() {
+        boolean changed = false;
+        for (ru.doksi.hungergames.arena.Arena arena : arenaManager.all()) {
+            if (!arena.containersDirty() || arena.worldUid() == null || Bukkit.getWorld(arena.worldUid()) == null) continue;
+            chestManager.clearContainers(arena);
+            arena.setContainersDirty(false);
+            changed = true;
+        }
+        if (changed) arenaManager.save();
     }
 
     @Override
@@ -100,6 +118,7 @@ public final class HungerGamesPlugin extends JavaPlugin {
         arenaManager.load();
         chestManager.load();
         accessManager.load();
+        clearDirtyContainers();
     }
 
     private void saveResourceIfMissing(String name) {
