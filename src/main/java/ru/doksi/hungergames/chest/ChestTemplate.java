@@ -4,16 +4,18 @@ import org.bukkit.inventory.ItemStack;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ThreadLocalRandom;
 
 public final class ChestTemplate {
     private final String id;
-    private String displayName;
-    private org.bukkit.Material icon;
-    private int minItems;
-    private int maxItems;
-    private double itemChance;
-    private final List<ItemStack> items = new ArrayList<>();
+    private volatile String displayName;
+    private volatile org.bukkit.Material icon;
+    private volatile int minItems;
+    private volatile int maxItems;
+    private volatile double itemChance;
+    // Лут генерируется в потоке региона контейнера, а редактируется из GUI в потоке сотрудника.
+    private final List<ItemStack> items = new CopyOnWriteArrayList<>();
 
     public ChestTemplate(String id, String displayName, org.bukkit.Material icon) {
         this.id = id;
@@ -43,9 +45,11 @@ public final class ChestTemplate {
         }
         List<ItemStack> result = new ArrayList<>();
         if (source.isEmpty()) return result;
-        int count = ThreadLocalRandom.current().nextInt(maxItems - minItems + 1) + minItems;
+        int min = minItems;
+        int count = ThreadLocalRandom.current().nextInt(Math.max(0, maxItems - min) + 1) + min;
+        double chance = itemChance;
         for (int i = 0; i < count; i++) {
-            if (ThreadLocalRandom.current().nextDouble() > itemChance) continue;
+            if (ThreadLocalRandom.current().nextDouble() > chance) continue;
             ItemStack picked = source.get(ThreadLocalRandom.current().nextInt(source.size())).clone();
             int maxStack = Math.max(1, Math.min(picked.getMaxStackSize(), picked.getAmount()));
             picked.setAmount(ThreadLocalRandom.current().nextInt(1, maxStack + 1));

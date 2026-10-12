@@ -74,7 +74,7 @@ public final class MatchHistoryManager {
         return records.isEmpty() ? null : records.get(0);
     }
 
-    public List<MatchRecord> get(String arenaId) {
+    public synchronized List<MatchRecord> get(String arenaId) {
         return List.copyOf(history.getOrDefault(arenaId.toLowerCase(Locale.ROOT), List.of()));
     }
 

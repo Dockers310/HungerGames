@@ -16,12 +16,14 @@ import ru.doksi.hungergames.arena.Arena;
 import ru.doksi.hungergames.arena.ArenaState;
 import ru.doksi.hungergames.arena.BorderMode;
 import ru.doksi.hungergames.chest.ChestTemplate;
+import ru.doksi.hungergames.game.GameManager;
 
 import java.util.*;
 
 public final class GuiManager {
     private final HungerGamesPlugin plugin;
-    private final Map<UUID, String> editorSessions = new HashMap<>();
+    // GUI открывают сотрудники из разных регионов Folia одновременно.
+    private final Map<UUID, String> editorSessions = new java.util.concurrent.ConcurrentHashMap<>();
     // Двойное подтверждение изменения/удаления уже существующих граничных точек из GUI.
     private final Map<UUID, PendingGuiPointChange> pendingGuiPointChanges = new java.util.concurrent.ConcurrentHashMap<>();
     private record PendingGuiPointChange(String arenaId, int point, boolean remove, long expiresAt) { }
@@ -177,19 +179,19 @@ public final class GuiManager {
     public void openAccess(Player p) {
         Inventory inv = create("access", null, null, 54, "&bСотрудники &8— &dДоступ HungerGames");
         int slot = 0;
-        LinkedHashSet<UUID> ids = new LinkedHashSet<>(plugin.getAccessManager().granted().keySet());
-        for (OfflinePlayer op : Bukkit.getOperators()) ids.add(op.getUniqueId());
-        ids.removeIf(uuid -> plugin.getAccessManager().isCreator(Bukkit.getOfflinePlayer(uuid)));
+        LinkedHashSet<UUID> ids = staffIds();
         for (UUID uuid : ids) {
             if (slot >= 45) break;
             OfflinePlayer op = Bukkit.getOfflinePlayer(uuid);
             boolean opFlag = op.isOp();
             boolean granted = plugin.getAccessManager().granted().containsKey(uuid);
-            String status = opFlag ? "&aOP" : "&eВыдан";
+            boolean byName = plugin.getAccessManager().isCreator(op);
+            String status = byName ? "&dПо нику (config.yml)" : opFlag ? "&aOP" : "&eВыдан";
             put(inv, slot++, head(op, op.getName() == null ? uuid.toString().substring(0,8) : op.getName(),
                     "&7Статус: " + status,
                     "&7Доступ к GUI и командам: &aДА",
-                    granted ? "&eЛКМ — убрать выданный доступ" : "&7OP управляется самим сервером"));
+                    granted ? "&eЛКМ — убрать выданный доступ"
+                            : byName ? "&7Убрать: access.creator-names в config.yml" : "&7OP управляется самим сервером"));
         }
         put(inv, 49, item(Material.PLAYER_HEAD, "&aДобавить сотрудника",
                 "&7Любой сотрудник с доступом может",
@@ -403,6 +405,12 @@ public final class GuiManager {
     public void handleClick(InventoryClickEvent e) {
         if (!(e.getWhoClicked() instanceof Player p)) return;
         if (!(e.getInventory().getHolder() instanceof GuiHolder holder)) return;
+        if (!plugin.getAccessManager().hasAccess(p)) {
+            // Доступ могли отозвать, пока меню было открыто.
+            e.setCancelled(true);
+            p.closeInventory();
+            return;
+        }
         if (holder.screen.equals("template-editor")) {
             int rawSlot = e.getRawSlot();
             if (rawSlot >= 45 && rawSlot < 54) {
@@ -577,7 +585,11 @@ public final class GuiManager {
             case 33 -> {plugin.getGameManager().stop(a,true);openArena(p,a);}
             case 40 -> { if(!right && !shift){ plugin.getInputManager().request(p, text->{String[] v=text.trim().split("\\s+");try{if(v.length>=3){double x=Double.parseDouble(v[0]),y=Double.parseDouble(v[1]),z=Double.parseDouble(v[2]);a.setPos1(new org.bukkit.Location(p.getWorld(),x,y,z));plugin.getArenaManager().save();openArena(p,a);}}catch(Exception ex){plugin.send(p,"invalid-coordinate");}});} else { int delta = shift ? (right ? -5 : 5) : 1; a.setMinPlayers(Math.max(1, a.minPlayers()+delta)); a.setMaxPlayers(Math.max(a.minPlayers(), a.maxPlayers()+delta)); plugin.getArenaManager().save();openArena(p,a);} }
             case 41 -> { a.setMaxPlayersBySpawns(!a.maxPlayersBySpawns()); plugin.getArenaManager().save(); openArena(p,a); }
-            case 42 -> { if(plugin.getAccessManager().isCreator(p)){plugin.getArenaManager().delete(a.id());openArenaList(p);} }
+            case 42 -> {
+                if (!plugin.getAccessManager().isAdmin(p)) { plugin.send(p, "arena-delete-denied"); return; }
+                if (plugin.getGameManager().deleteArena(a)) { plugin.send(p, "arena-deleted", "arena", a.id()); openArenaList(p); }
+                else plugin.send(p, "arena-busy", "arena", a.id());
+            }
             case 53 -> openArenaList(p);
         }
     }
@@ -718,22 +730,23 @@ public final class GuiManager {
     private void participantClick(Player p,String id,int s){
         Arena a=plugin.getArenaManager().get(id); if(a==null)return;
         if(s<45){int i=0;for(UUID u:new ArrayList<>(a.participants())){if(i++==s){
-            if(a.state()==ArenaState.WAITING){a.participants().remove(u);a.clearSpawnSlot(u);plugin.getArenaManager().save();plugin.send(p,"participant-removed","player",Bukkit.getOfflinePlayer(u).getName());openParticipants(p,a);}return;
+            GameManager.ParticipantChange result = plugin.getGameManager().removeParticipant(a, u);
+            if(result==GameManager.ParticipantChange.OK){plugin.send(p,"participant-removed","player",Bukkit.getOfflinePlayer(u).getName());openParticipants(p,a);}
+            else if(result==GameManager.ParticipantChange.LOCKED) plugin.send(p,"participants-locked");
+            return;
         }}}
         if(s==49){
             if(a.state()!=ArenaState.WAITING){plugin.send(p,"participants-locked");return;}
-            plugin.getInputManager().request(p,text->{org.bukkit.OfflinePlayer target=Bukkit.getOfflinePlayer(text.trim());if(a.participants().contains(target.getUniqueId())){plugin.send(p,"already-participant-target","player",text.trim());return;}if(a.participants().size()>=a.maxPlayers()){plugin.send(p,"join-full");return;}int freeSlot=plugin.getGameManager().assignParticipantSpawn(a,target.getUniqueId());if(freeSlot<0){plugin.send(p,"no-spawn-slots");return;}a.participants().add(target.getUniqueId());
-                Player targetPlayer = plugin.getGameManager().getOnlinePlayer(target.getUniqueId());
-                if (targetPlayer != null) {
-                    targetPlayer.getScheduler().run(plugin, ignored -> {
-                        plugin.getGameManager().rememberParticipantState(targetPlayer);
-                        plugin.getGameManager().teleportParticipantToAssignedSpawn(targetPlayer, a);
-                        plugin.send(targetPlayer, "participant-added-you", "arena", a.id());
-                    }, null);
-                }
-                plugin.getArenaManager().save();
-                plugin.send(p,"participant-added","player",target.getName()==null?text.trim():target.getName());
-                openParticipants(p,a);});
+            plugin.getInputManager().request(p,text->{org.bukkit.OfflinePlayer target=Bukkit.getOfflinePlayer(text.trim());
+                String targetName = target.getName()==null?text.trim():target.getName();
+                switch (plugin.getGameManager().addParticipant(a, target.getUniqueId())) {
+                    case OK -> { plugin.send(p,"participant-added","player",targetName); openParticipants(p,a); }
+                    case LOCKED -> plugin.send(p,"participants-locked");
+                    case ALREADY -> plugin.send(p,"already-participant-target","player",text.trim());
+                    case IN_OTHER_ARENA -> plugin.send(p,"target-in-other-arena","player",targetName);
+                    case NO_SLOT -> plugin.send(p,"no-spawn-slots");
+                    default -> plugin.send(p,"join-full");
+                }});
             return;
         }
         if(s==53)openArena(p,a);
@@ -756,17 +769,16 @@ public final class GuiManager {
         else if(s==26){openArena(p,a);}
     }
     private void accessClick(Player p, int s) {
-        LinkedHashSet<UUID> ids = new LinkedHashSet<>(plugin.getAccessManager().granted().keySet());
-        for (OfflinePlayer op : Bukkit.getOperators()) ids.add(op.getUniqueId());
-        ids.removeIf(uuid -> plugin.getAccessManager().isCreator(Bukkit.getOfflinePlayer(uuid)));
+        LinkedHashSet<UUID> ids = staffIds();
         if (s < 45) {
             int i = 0;
             for (UUID u : ids) {
                 if (i++ != s) continue;
                 if (plugin.getAccessManager().granted().containsKey(u)) {
                     String name = plugin.getAccessManager().displayName(u);
-                    if (plugin.getAccessManager().remove(name)) plugin.send(p, "access-removed", "player", name);
-                    else plugin.send(p, "access-remove-failed", "player", name);
+                    if (!plugin.getAccessManager().remove(name)) plugin.send(p, "access-remove-failed", "player", name);
+                    else if (plugin.getAccessManager().isCreatorName(name)) plugin.send(p, "access-by-name", "player", name);
+                    else plugin.send(p, "access-removed", "player", name);
                 }
                 openAccess(p);
                 return;
@@ -781,6 +793,18 @@ public final class GuiManager {
             return;
         }
         if (s == 53) openMain(p);
+    }
+
+    /** Сотрудники в порядке показа: выданный доступ, OP, доступ по нику из config.yml. */
+    private LinkedHashSet<UUID> staffIds() {
+        LinkedHashSet<UUID> ids = new LinkedHashSet<>(plugin.getAccessManager().granted().keySet());
+        for (OfflinePlayer op : Bukkit.getOperators()) ids.add(op.getUniqueId());
+        for (String name : plugin.getAccessManager().creatorNames()) {
+            // Только игроки, уже заходившие на сервер: поиск по нику не должен обращаться к сети.
+            OfflinePlayer known = Bukkit.getOfflinePlayerIfCached(name);
+            if (known != null && plugin.getAccessManager().isCreator(known)) ids.add(known.getUniqueId());
+        }
+        return ids;
     }
 
     private void timeClick(Player p, String id, int s, boolean right, boolean shift) {
